@@ -1,0 +1,89 @@
+@HostAddress = http://127.0.0.1:5000
+@Cookie = YOUR_GEMINI_COOKIES_HERE
+
+### Health Check (无需鉴权)
+GET {{HostAddress}}/v1/health
+
+### List Models (模型列表 - 包含 4 Argon、3.8 Flash、3.5 Flash-Lite、3.1 Pro 等)
+GET {{HostAddress}}/v1/models
+Authorization: Bearer {{Cookie}}
+
+### Chat Completion - 3.8 Flash (推荐最强思考模型)
+POST {{HostAddress}}/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer {{Cookie}}
+
+{
+  "model": "gemini-3.8-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Which is bigger: 9.9 or 9.11? Explain your reasoning."
+    }
+  ]
+}
+
+### Chat Completion - 3.5 Flash-Lite (轻量极速模型)
+POST {{HostAddress}}/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer {{Cookie}}
+
+{
+  "model": "gemini-3.5-flash-lite",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize the theory of relativity in one sentence."
+    }
+  ]
+}
+
+### Chat Completion - 3.1 Pro (高精度专业推理)
+POST {{HostAddress}}/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer {{Cookie}}
+
+{
+  "model": "gemini-3.1-pro",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a Python function to solve the Two Sum problem with O(n) complexity."
+    }
+  ]
+}
+
+### Chat Completion - 4 Argon (下一代前沿实验模型)
+POST {{HostAddress}}/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer {{Cookie}}
+
+{
+  "model": "gemini-4-argon",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What are the latest breakthroughs in quantum computing?"
+    }
+  ]
+}
+
+### Chat Completion - Streaming (实时流式 SSE 问答)
+POST {{HostAddress}}/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer {{Cookie}}
+
+{
+  "model": "gemini-3.8-flash",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a poetic assistant."
+    },
+    {
+      "role": "user",
+      "content": "Write a 4-line poem about artificial intelligence."
+    }
+  ],
+  "stream": true
+}

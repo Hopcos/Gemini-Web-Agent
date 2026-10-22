@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  gemini-web-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemini-web-agent
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - GeminiWeb__BaseUrl=https://gemini.google.com
+      - GeminiWeb__CookieSource=${GEMINI_WEB_COOKIE_SOURCE:-Manual}
+      - GeminiWeb__Cookies=${GEMINI_WEB_COOKIES:-}
+      - GeminiWeb__CookieFilePath=/app/cookies.json
+      - GeminiWeb__EnableAutoRenewal=true
+      - GeminiWeb__KeepAliveIntervalMinutes=120
+    volumes:
+      # 持久化存储滚动更新后的 cookies，实现容器重启或崩溃后无缝恢复
+      - ./cookies.json:/app/cookies.json

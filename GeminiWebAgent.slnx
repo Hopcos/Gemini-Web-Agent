@@ -1,0 +1,21 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GeminiWebAgent/GeminiWebAgent.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GeminiWebAgent.Tests/GeminiWebAgent.Tests.csproj" />
+  </Folder>
+  <Folder Name="/解决方案项/">
+    <File Path=".env.example" />
+    <File Path=".gitignore" />
+    <File Path="docker-compose.yml" />
+    <File Path="Dockerfile" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/解决方案项/scripts/">
+    <File Path="scripts/start_background.ps1" />
+    <File Path="scripts/start_gateway.ps1" />
+    <File Path="scripts/stop_gateway.ps1" />
+    <File Path="scripts/verify_all.ps1" />
+  </Folder>
+</Solution>
