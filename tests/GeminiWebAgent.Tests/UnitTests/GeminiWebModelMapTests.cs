@@ -6,36 +6,39 @@ namespace GeminiWebAgent.Tests.UnitTests;
 public class GeminiWebModelMapTests
 {
     [Theory]
-    [InlineData("gemini-4-argon", "models/gemini-4-argon")]
-    [InlineData("4 Argon", "models/gemini-4-argon")]
-    [InlineData("4-argon", "models/gemini-4-argon")]
-    [InlineData("argon", "models/gemini-4-argon")]
-    [InlineData("gemini-3.8-flash", "models/gemini-3.8-flash")]
-    [InlineData("3.8 Flash", "models/gemini-3.8-flash")]
-    [InlineData("3.8-flash", "models/gemini-3.8-flash")]
-    [InlineData("gemini-3.5-flash-lite", "models/gemini-3.5-flash-lite")]
-    [InlineData("3.5 Flash-Lite", "models/gemini-3.5-flash-lite")]
-    [InlineData("3.5-flash-lite", "models/gemini-3.5-flash-lite")]
-    [InlineData("gemini-3.1-pro", "models/gemini-3.1-pro")]
-    [InlineData("3.1 Pro", "models/gemini-3.1-pro")]
-    [InlineData("3.1-pro", "models/gemini-3.1-pro")]
-    [InlineData("gemini-2.5-pro", "models/gemini-2.5-pro")]
-    [InlineData("gemini-2.5-flash", "models/gemini-2.5-flash")]
-    [InlineData("gemini-2.5-flash-thinking", "models/gemini-2.5-flash-thinking")]
-    [InlineData("gemini-2.0-flash", "models/gemini-2.0-flash")]
-    [InlineData("gemini-1.5-pro", "models/gemini-1.5-pro")]
-    [InlineData("GEMINI-2.5-FLASH", "models/gemini-2.5-flash")] // Case-insensitive
-    public void GetGeminiModelId_KnownModel_ReturnsExpectedMapping(string input, string expected)
+    [InlineData("gemini-4-argon", "gemini-4-argon", 3, 4)]
+    [InlineData("4 Argon", "gemini-4-argon", 3, 4)]
+    [InlineData("4-argon", "gemini-4-argon", 3, 4)]
+    [InlineData("argon", "gemini-4-argon", 3, 4)]
+    [InlineData("gemini-3.8-flash", "gemini-3.8-flash", 1, 4)]
+    [InlineData("3.8 Flash", "gemini-3.8-flash", 1, 4)]
+    [InlineData("3.8-flash", "gemini-3.8-flash", 1, 4)]
+    [InlineData("gemini-3.5-flash-lite", "gemini-3.5-flash-lite", 6, 4)]
+    [InlineData("3.5 Flash-Lite", "gemini-3.5-flash-lite", 6, 4)]
+    [InlineData("3.5-flash-lite", "gemini-3.5-flash-lite", 6, 4)]
+    [InlineData("gemini-3.1-pro", "gemini-3.1-pro", 3, 4)]
+    [InlineData("3.1 Pro", "gemini-3.1-pro", 3, 4)]
+    [InlineData("3.1-pro", "gemini-3.1-pro", 3, 4)]
+    [InlineData("gemini-2.5-pro", "gemini-2.5-pro", 3, 4)]
+    [InlineData("gemini-2.5-flash", "gemini-2.5-flash", 1, 4)]
+    [InlineData("gemini-2.5-flash-thinking", "gemini-2.5-flash-thinking", 2, 0)]
+    [InlineData("gemini-2.0-flash", "gemini-2.0-flash", 1, 4)]
+    [InlineData("gemini-1.5-pro", "gemini-1.5-pro", 3, 4)]
+    [InlineData("GEMINI-2.5-FLASH", "gemini-2.5-flash", 1, 4)]
+    public void GetModelConfig_KnownModel_ReturnsExpectedConfig(string input, string expectedCanonical, int expectedMode, int expectedThink)
     {
-        var result = GeminiWebModelMap.GetGeminiModelId(input);
-        Assert.Equal(expected, result);
+        var config = GeminiWebModelMap.GetModelConfig(input);
+        Assert.Equal(expectedCanonical, config.CanonicalName);
+        Assert.Equal(expectedMode, config.ModeCategory);
+        Assert.Equal(expectedThink, config.ThinkMode);
     }
 
     [Fact]
-    public void GetGeminiModelId_UnknownModel_PrependsModelsPrefix()
+    public void GetModelConfig_UnknownModel_FallsBackToDefault()
     {
-        var result = GeminiWebModelMap.GetGeminiModelId("custom-gemini-model");
-        Assert.Equal("models/custom-gemini-model", result);
+        var config = GeminiWebModelMap.GetModelConfig("custom-gemini-model");
+        Assert.Equal("gemini-3.8-flash", config.CanonicalName);
+        Assert.Equal(1, config.ModeCategory);
     }
 
     [Fact]

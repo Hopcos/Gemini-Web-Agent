@@ -21,6 +21,7 @@ public partial class GeminiWebSessionService(
     private string _buildLabel = string.Empty;
     private string _atToken = string.Empty;
     private string _sessionId = string.Empty;
+    private string _lastCookies = string.Empty;
     private int _requestId = 100000;
     private DateTime _lastRefresh = DateTime.MinValue;
 
@@ -70,6 +71,7 @@ public partial class GeminiWebSessionService(
     public void InvalidateSession()
     {
         _lastRefresh = DateTime.MinValue;
+        _lastCookies = string.Empty;
     }
 
     private async Task EnsureSessionAsync(string cookies)
@@ -153,6 +155,10 @@ public partial class GeminiWebSessionService(
         {
             _atToken = atMatch.Groups[1].Value;
             logger.LogInformation("Extracted AT token successfully");
+        }
+        else if (!string.IsNullOrEmpty(_atToken))
+        {
+            logger.LogWarning("Could not extract new AT token from Gemini Web page, retaining existing token");
         }
         else
         {

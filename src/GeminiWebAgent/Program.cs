@@ -12,11 +12,17 @@ builder.Services.Configure<GeminiWebOptions>(builder.Configuration.GetSection("G
 builder.Services.AddHttpClient("GeminiWebSession", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(2);
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    UseCookies = false
 });
 
 builder.Services.AddHttpClient<GeminiWebChatService>(client =>
 {
     client.Timeout = TimeSpan.FromMinutes(5);
+}).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    UseCookies = false
 });
 
 // Services

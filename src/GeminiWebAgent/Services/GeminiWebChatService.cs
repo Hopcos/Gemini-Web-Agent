@@ -27,10 +27,11 @@ public partial class GeminiWebChatService(
     /// </summary>
     public async Task<OpenAIChatCompletionResponse> ChatCompletionAsync(string cookies, OpenAIChatCompletionRequest request)
     {
-        var prompt = BuildPromptFromMessages(request.Messages);
-        var model = request.Model;
+        var modelConfig = GeminiWebModelMap.GetModelConfig(request.Model);
+        var prompt = BuildPromptFromMessages(request.Messages, modelConfig);
+        var model = modelConfig.CanonicalName;
 
-        var responseText = await SendBatchExecuteAsync(cookies, prompt, model, stream: false);
+        var responseText = await SendBatchExecuteAsync(cookies, prompt, modelConfig, stream: false);
         var parsedText = ParseBatchExecuteResponse(responseText);
 
         return BuildOpenAIResponse(parsedText, model);
@@ -41,29 +42,44 @@ public partial class GeminiWebChatService(
     /// </summary>
     public async Task StreamChatCompletionAsync(string cookies, OpenAIChatCompletionRequest request, HttpResponse httpResponse)
     {
-        var prompt = BuildPromptFromMessages(request.Messages);
-        var model = request.Model;
+        var modelConfig = GeminiWebModelMap.GetModelConfig(request.Model);
+        var prompt = BuildPromptFromMessages(request.Messages, modelConfig);
+        var model = modelConfig.CanonicalName;
 
         var completionId = $"chatcmpl-{Guid.NewGuid():N}";
         var isFirstChunk = true;
 
         try
         {
-            var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, model, stream: true);
+            var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
 
-            using var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
+            var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
             await cookieManager.UpdateFromResponseAsync(response);
 
-            if (!response.IsSuccessStatusCode)
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
+                response.StatusCode == System.Net.HttpStatusCode.Forbidden)
             {
-                var errorBody = await response.Content.ReadAsStringAsync();
-                logger.LogError("Gemini Web streaming error: {StatusCode} - {Body}", response.StatusCode, errorBody);
+                logger.LogInformation("Refreshing session and retrying streaming request after 401/403...");
+                sessionService.InvalidateSession();
+                response.Dispose();
 
-                var errorChunk = CreateStreamErrorChunk(model, completionId, $"Gemini Web error: {response.StatusCode}");
-                await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(errorChunk)}\n\n");
-                await httpResponse.WriteAsync("data: [DONE]\n\n");
-                return;
+                httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
+                response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
+                await cookieManager.UpdateFromResponseAsync(response);
             }
+
+            using (response)
+            {
+                if (!response.IsSuccessStatusCode)
+                {
+                    var errorBody = await response.Content.ReadAsStringAsync();
+                    logger.LogError("Gemini Web streaming error: {StatusCode} - {Body}", response.StatusCode, errorBody);
+
+                    var errorChunk = CreateStreamErrorChunk(model, completionId, $"Gemini Web error: {response.StatusCode}");
+                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(errorChunk)}\n\n");
+                    await httpResponse.WriteAsync("data: [DONE]\n\n");
+                    return;
+                }
 
             using var stream = await response.Content.ReadAsStreamAsync();
             using var reader = new StreamReader(stream);
@@ -110,6 +126,7 @@ public partial class GeminiWebChatService(
             await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk)}\n\n");
             await httpResponse.WriteAsync("data: [DONE]\n\n");
             await httpResponse.Body.FlushAsync();
+            }
         }
         catch (Exception ex)
         {
@@ -123,12 +140,15 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Builds a single text prompt from OpenAI messages.
+    /// Builds a single text prompt from OpenAI messages, including model persona grounding.
     /// Handles system, user, and assistant messages.
     /// </summary>
-    private static string BuildPromptFromMessages(List<OpenAIMessage> messages)
+    private static string BuildPromptFromMessages(List<OpenAIMessage> messages, GeminiWebModelConfig modelConfig)
     {
         var parts = new List<string>();
+
+        // Model persona grounding
+        parts.Add($"[System Instructions]\nYou are {modelConfig.DisplayName}, Google's {modelConfig.Description}. When asked about your model name or identity, clearly and directly identify yourself as {modelConfig.DisplayName}.");
 
         foreach (var message in messages)
         {
@@ -180,17 +200,30 @@ public partial class GeminiWebChatService(
     /// <summary>
     /// Sends a request to the Gemini Web batchexecute endpoint.
     /// </summary>
-    private async Task<string> SendBatchExecuteAsync(string cookies, string prompt, string model, bool stream)
+    private async Task<string> SendBatchExecuteAsync(string cookies, string prompt, GeminiWebModelConfig modelConfig, bool stream)
     {
-        var request = await BuildBatchExecuteRequestAsync(cookies, prompt, model, stream);
-
-        var response = await httpClient.SendAsync(request);
-        await cookieManager.UpdateFromResponseAsync(response);
-        var responseBody = await response.Content.ReadAsStringAsync();
-
-        if (!response.IsSuccessStatusCode)
+        for (var attempt = 1; attempt <= 2; attempt++)
         {
-            logger.LogError("Gemini Web API error: {StatusCode} - {Body}", response.StatusCode, responseBody);
+            var request = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream);
+
+            var response = await httpClient.SendAsync(request);
+            await cookieManager.UpdateFromResponseAsync(response);
+            var responseBody = await response.Content.ReadAsStringAsync();
+
+            if (response.IsSuccessStatusCode)
+            {
+                return responseBody;
+            }
+
+            logger.LogWarning("Gemini Web API error on attempt {Attempt}: {StatusCode} - {Body}", attempt, response.StatusCode, responseBody);
+
+            if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
+                 response.StatusCode == System.Net.HttpStatusCode.Forbidden) && attempt == 1)
+            {
+                logger.LogInformation("Refreshing session and retrying after 401/403...");
+                sessionService.InvalidateSession();
+                continue;
+            }
 
             if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
                 response.StatusCode == System.Net.HttpStatusCode.Forbidden)
@@ -202,33 +235,26 @@ public partial class GeminiWebChatService(
             throw new HttpRequestException($"Gemini Web API error: {response.StatusCode} - {responseBody}");
         }
 
-        return responseBody;
+        throw new HttpRequestException("Failed to send request to Gemini Web after retry.");
     }
 
     /// <summary>
     /// Builds the batchexecute HTTP request.
     /// </summary>
-    private async Task<HttpRequestMessage> BuildBatchExecuteRequestAsync(string cookies, string prompt, string model, bool stream)
+    private async Task<HttpRequestMessage> BuildBatchExecuteRequestAsync(string cookies, string prompt, GeminiWebModelConfig modelConfig, bool stream)
     {
         var bl = await sessionService.GetBuildLabelAsync(cookies);
         var at = await sessionService.GetAtTokenAsync(cookies);
         var sid = await sessionService.GetSessionIdAsync(cookies);
         var reqId = sessionService.GetNextRequestId();
 
-        var geminiModelId = GeminiWebModelMap.GetGeminiModelId(model);
-
-        // Build the StreamGenerate prompt payload structure
-        var messageStruct = new object?[]
-        {
-            new object?[] { prompt },
-            null,
-            null
-        };
+        // Construct 80-element internal payload for StreamGenerate
+        var inner = BuildStreamGenerateInnerPayload(prompt, modelConfig);
 
         var fReq = JsonSerializer.Serialize(new object?[]
         {
             null,
-            JsonSerializer.Serialize(messageStruct)
+            JsonSerializer.Serialize(inner)
         });
 
         // Build URL with query parameters
@@ -236,6 +262,7 @@ public partial class GeminiWebChatService(
         var queryParams = new Dictionary<string, string>
         {
             ["bl"] = bl,
+            ["hl"] = "en",
             ["_reqid"] = reqId.ToString(),
             ["rt"] = "c"
         };
@@ -266,116 +293,39 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Builds the inner payload structure for the batchexecute request.
+    /// Builds the 80-element internal payload structure for StreamGenerate.
+    /// Index [79] corresponds to the MODE_CATEGORY enum for model routing.
+    /// Index [17] corresponds to the thinking mode configuration.
     /// </summary>
-    private static object?[] BuildInnerPayload(string prompt, string geminiModelId)
+    public static object?[] BuildStreamGenerateInnerPayload(string prompt, GeminiWebModelConfig modelConfig)
     {
-        // The payload format is a deeply nested array structure
-        // Position [0] = prompt parts array
-        // Position [1] = conversation context (null for new)
-        // Position [2] = model configuration
-        return
-        [
-            new object?[]
-            {
-                new object?[] { prompt }  // Prompt text
-            },
-            null,  // Conversation ID (null = new conversation)
-            null,  // Response ID
-            null,
-            null,
-            null,
-            new object?[]
-            {
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                geminiModelId  // Position [79] — model identifier
-            }
-        ];
+        var inner = new object?[80];
+        inner[0] = new object?[] { prompt, 0, null, null, null, null, 0 };
+        inner[1] = new object?[] { "en" };
+        inner[2] = new object?[] { "", "", "", null, null, null, null, null, null, "" };
+        inner[6] = new object?[] { 0 };
+        inner[7] = 1;
+        inner[10] = 1;
+        inner[11] = 0;
+        inner[17] = new object?[] { new object?[] { modelConfig.ThinkMode } };
+        inner[18] = 0;
+        inner[27] = 1;
+        inner[30] = new object?[] { 4 };
+        inner[41] = new object?[] { 2 };
+        inner[53] = 0;
+        inner[59] = Guid.NewGuid().ToString();
+        inner[61] = Array.Empty<object>();
+        inner[68] = 1;
+        inner[79] = modelConfig.ModeCategory;
+
+        return inner;
     }
 
     /// <summary>
     /// Parses the batchexecute response format.
     /// Response starts with ")]}'\\n" prefix and contains nested JSON arrays.
     /// </summary>
-    private string ParseBatchExecuteResponse(string responseBody)
+    public string ParseBatchExecuteResponse(string responseBody)
     {
         try
         {

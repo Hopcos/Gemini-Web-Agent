@@ -1,4 +1,6 @@
 using System.Text.Json;
+using GeminiWebAgent.Models.GeminiWeb;
+using GeminiWebAgent.Services;
 
 namespace GeminiWebAgent.Tests.UnitTests;
 
@@ -54,20 +56,17 @@ public class BatchExecutePayloadTests
     }
 
     [Fact]
-    public void StreamGenerate_FReqWrapper_HasValidMessageStructure()
+    public void BuildStreamGenerateInnerPayload_SetsModelCategoryAndStructure()
     {
-        var messageStruct = new object?[]
-        {
-            new object?[] { "Hello from Gemini" },
-            null,
-            null
-        };
+        var modelConfig = GeminiWebModelMap.GetModelConfig("gemini-4-argon");
+        var inner = GeminiWebChatService.BuildStreamGenerateInnerPayload("Test prompt", modelConfig);
 
-        var fReq = JsonSerializer.Serialize(new object?[]
-        {
-            null,
-            JsonSerializer.Serialize(messageStruct)
-        });
+        Assert.Equal(80, inner.Length);
+        Assert.Equal(3, inner[79]); // ModeCategory 3 for PRO/Argon
+        Assert.Equal(2, (inner[41] as object[])?[0]); // Persistence flag [2]
+
+        var outer = new object?[] { null, JsonSerializer.Serialize(inner) };
+        var fReq = JsonSerializer.Serialize(outer);
 
         var doc = JsonDocument.Parse(fReq);
         Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
@@ -77,6 +76,7 @@ public class BatchExecutePayloadTests
 
         var innerDoc = JsonDocument.Parse(doc.RootElement[1].GetString()!);
         Assert.Equal(JsonValueKind.Array, innerDoc.RootElement.ValueKind);
-        Assert.Equal("Hello from Gemini", innerDoc.RootElement[0][0].GetString());
+        Assert.Equal(80, innerDoc.RootElement.GetArrayLength());
+        Assert.Equal(3, innerDoc.RootElement[79].GetInt32());
     }
 }
