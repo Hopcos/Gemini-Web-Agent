@@ -4,22 +4,15 @@ namespace GeminiWebAgent.Tests.UnitTests;
 
 public partial class GeminiWebSessionExtractionTests
 {
-    [Fact]
-    public void BuildLabelRegex_ExtractsExpectedLabel()
+    [Theory]
+    [InlineData(@"""cfb2h"":""boq_gemini-web-uiserver_20261021.15_p0""", "boq_gemini-web-uiserver_20261021.15_p0")]
+    [InlineData(@"""cfb2h"": ""boq_gemini-web-uiserver_20261022.00_p0""", "boq_gemini-web-uiserver_20261022.00_p0")]
+    [InlineData(@"""cfb2h"":""boq_assistant-bard-web-server_20240901.08_p0""", "boq_assistant-bard-web-server_20240901.08_p0")]
+    public void BuildLabelRegex_ExtractsExpectedLabel(string snippet, string expected)
     {
-        var sampleHtml = """
-        <html>
-        <head>
-        <script>
-        window.WIZ_global_data = {"cfb2h":"boq_assistant-bard-web-server_20240901.08_p0","SNlM0e":"AIzaSyD-sample-at-token-value","FdrFJe":"1234567890123456789"};
-        </script>
-        </head>
-        </html>
-        """;
-
-        var match = BuildLabelRegex().Match(sampleHtml);
+        var match = BuildLabelRegex().Match(snippet);
         Assert.True(match.Success);
-        Assert.Equal("boq_assistant-bard-web-server_20240901.08_p0", match.Groups[1].Value);
+        Assert.Equal(expected, match.Groups[1].Value);
     }
 
     [Fact]
@@ -27,13 +20,13 @@ public partial class GeminiWebSessionExtractionTests
     {
         var sampleHtml = """
         <script>
-        "SNlM0e":"AIzaSyD_SampleToken_12345ABCDE"
+        "SNlM0e":"AIaPT3NwJaU_px89M3pXwjlPP6sf:1792715943717"
         </script>
         """;
 
         var match = AtTokenRegex().Match(sampleHtml);
         Assert.True(match.Success);
-        Assert.Equal("AIzaSyD_SampleToken_12345ABCDE", match.Groups[1].Value);
+        Assert.Equal("AIaPT3NwJaU_px89M3pXwjlPP6sf:1792715943717", match.Groups[1].Value);
     }
 
     [Fact]
@@ -41,21 +34,21 @@ public partial class GeminiWebSessionExtractionTests
     {
         var sampleHtml = """
         <script>
-        "FdrFJe":"9876543210987654321"
+        "FdrFJe":"-8883572114637741986"
         </script>
         """;
 
         var match = SessionIdRegex().Match(sampleHtml);
         Assert.True(match.Success);
-        Assert.Equal("9876543210987654321", match.Groups[1].Value);
+        Assert.Equal("-8883572114637741986", match.Groups[1].Value);
     }
 
-    [GeneratedRegex(@"""cfb2h"":""(boq_assistant[^""]+)""")]
+    [GeneratedRegex(@"""cfb2h""\s*:\s*""([^""]+)""")]
     private static partial Regex BuildLabelRegex();
 
-    [GeneratedRegex(@"""SNlM0e"":""([^""]+)""")]
+    [GeneratedRegex(@"""SNlM0e""\s*:\s*""([^""]+)""")]
     private static partial Regex AtTokenRegex();
 
-    [GeneratedRegex(@"""FdrFJe"":""([^""]+)""")]
+    [GeneratedRegex(@"""FdrFJe""\s*:\s*""([^""]+)""")]
     private static partial Regex SessionIdRegex();
 }

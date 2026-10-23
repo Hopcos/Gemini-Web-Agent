@@ -97,9 +97,12 @@ public partial class GeminiWebSessionService(
     {
         logger.LogInformation("Refreshing Gemini Web session parameters...");
 
-        var request = new HttpRequestMessage(HttpMethod.Get, _options.BaseUrl);
+        var targetUrl = $"{_options.BaseUrl.TrimEnd('/')}/app";
+        var request = new HttpRequestMessage(HttpMethod.Get, targetUrl);
         request.Headers.Add("Cookie", cookies);
         request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+        request.Headers.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+        request.Headers.Add("Accept-Language", "en-US,en;q=0.9");
 
         var response = await _httpClient.SendAsync(request);
         await cookieManager.UpdateFromResponseAsync(response);
@@ -107,11 +110,21 @@ public partial class GeminiWebSessionService(
 
         if (!response.IsSuccessStatusCode)
         {
-            logger.LogError("Failed to fetch Gemini Web page: {StatusCode}", response.StatusCode);
-            throw new HttpRequestException($"Failed to fetch Gemini Web page: {response.StatusCode}");
+            logger.LogWarning("Fetch from /app failed with {StatusCode}, falling back to BaseUrl...", response.StatusCode);
+            var fallbackReq = new HttpRequestMessage(HttpMethod.Get, _options.BaseUrl);
+            fallbackReq.Headers.Add("Cookie", cookies);
+            fallbackReq.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            response = await _httpClient.SendAsync(fallbackReq);
+            html = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogError("Failed to fetch Gemini Web page: {StatusCode}", response.StatusCode);
+                throw new HttpRequestException($"Failed to fetch Gemini Web page: {response.StatusCode}");
+            }
         }
 
-        // Extract build label (bl parameter)
+        // Extract build label (bl parameter / cfb2h)
         var blMatch = BuildLabelRegex().Match(html);
         if (blMatch.Success)
         {
@@ -120,8 +133,18 @@ public partial class GeminiWebSessionService(
         }
         else
         {
-            logger.LogWarning("Could not extract build label from Gemini Web page");
-            throw new InvalidOperationException("Could not extract build label (bl) from Gemini Web page. Cookies may be invalid or expired.");
+            // Fallback: search for any boq_ server build label
+            var fallbackBoq = FallbackBuildLabelRegex().Match(html);
+            if (fallbackBoq.Success)
+            {
+                _buildLabel = fallbackBoq.Value;
+                logger.LogInformation("Extracted fallback build label: {BuildLabel}", _buildLabel);
+            }
+            else
+            {
+                _buildLabel = "boq_gemini-web-uiserver_20261022.00_p0";
+                logger.LogWarning("Could not extract build label, using default fallback: {BuildLabel}", _buildLabel);
+            }
         }
 
         // Extract AT token (SNlM0e)
@@ -157,12 +180,15 @@ public partial class GeminiWebSessionService(
         logger.LogInformation("Gemini Web session refreshed successfully");
     }
 
-    [GeneratedRegex(@"""cfb2h"":""(boq_assistant[^""]+)""")]
+    [GeneratedRegex(@"""cfb2h""\s*:\s*""([^""]+)""")]
     private static partial Regex BuildLabelRegex();
 
-    [GeneratedRegex(@"""SNlM0e"":""([^""]+)""")]
+    [GeneratedRegex(@"""SNlM0e""\s*:\s*""([^""]+)""")]
     private static partial Regex AtTokenRegex();
 
-    [GeneratedRegex(@"""FdrFJe"":""([^""]+)""")]
+    [GeneratedRegex(@"""FdrFJe""\s*:\s*""([^""]+)""")]
     private static partial Regex SessionIdRegex();
+
+    [GeneratedRegex(@"boq_[a-zA-Z0-9_\-\.]+")]
+    private static partial Regex FallbackBuildLabelRegex();
 }

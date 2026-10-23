@@ -68,35 +68,26 @@ public partial class GeminiWebChatService(
             using var stream = await response.Content.ReadAsStreamAsync();
             using var reader = new StreamReader(stream);
 
-            var buffer = new StringBuilder();
+            var previousLength = 0;
 
             while (await reader.ReadLineAsync() is { } line)
             {
-                if (string.IsNullOrWhiteSpace(line)) continue;
+                var trimmed = line.Trim();
+                if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
+                    continue;
 
-                buffer.AppendLine(line);
-
-                // Try to parse accumulated buffer for text content
-                var currentText = ExtractStreamingText(buffer.ToString());
-                if (!string.IsNullOrEmpty(currentText))
+                var currentText = ExtractStreamingText(trimmed);
+                if (!string.IsNullOrEmpty(currentText) && currentText.Length > previousLength)
                 {
-                    var chunk = BuildStreamChunk(currentText, model, completionId, isFirstChunk);
+                    var deltaText = currentText[previousLength..];
+                    previousLength = currentText.Length;
+
+                    var chunk = BuildStreamChunk(deltaText, model, completionId, isFirstChunk);
                     isFirstChunk = false;
 
                     await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
                     await httpResponse.Body.FlushAsync();
-
-                    buffer.Clear();
                 }
-            }
-
-            // Send any remaining content
-            var remainingText = ExtractStreamingText(buffer.ToString());
-            if (!string.IsNullOrEmpty(remainingText))
-            {
-                var chunk = BuildStreamChunk(remainingText, model, completionId, isFirstChunk);
-                await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
-                await httpResponse.Body.FlushAsync();
             }
 
             // Send final chunk with finish_reason
@@ -226,33 +217,27 @@ public partial class GeminiWebChatService(
 
         var geminiModelId = GeminiWebModelMap.GetGeminiModelId(model);
 
-        // Build the inner request payload
-        // The batchexecute format wraps the prompt in a deeply nested JSON array
-        var innerPayload = BuildInnerPayload(prompt, geminiModelId);
-        var serializedInner = JsonSerializer.Serialize(innerPayload);
+        // Build the StreamGenerate prompt payload structure
+        var messageStruct = new object?[]
+        {
+            new object?[] { prompt },
+            null,
+            null
+        };
 
-        // Build the f.req outer wrapper
         var fReq = JsonSerializer.Serialize(new object?[]
         {
-            new object?[]
-            {
-                new object?[]
-                {
-                    "otAQ7b",
-                    serializedInner,
-                    null,
-                    "generic"
-                }
-            }
+            null,
+            JsonSerializer.Serialize(messageStruct)
         });
 
         // Build URL with query parameters
-        var baseUrl = $"{_options.BaseUrl}/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+        var baseUrl = $"{_options.BaseUrl.TrimEnd('/')}/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
         var queryParams = new Dictionary<string, string>
         {
             ["bl"] = bl,
             ["_reqid"] = reqId.ToString(),
-            ["rt"] = stream ? "c" : "b"
+            ["rt"] = "c"
         };
 
         var queryString = string.Join("&", queryParams.Select(kv => $"{kv.Key}={HttpUtility.UrlEncode(kv.Value)}"));
@@ -273,7 +258,7 @@ public partial class GeminiWebChatService(
         // Set browser-like headers
         request.Headers.Add("Cookie", cookies);
         request.Headers.Add("Origin", _options.BaseUrl);
-        request.Headers.Add("Referer", $"{_options.BaseUrl}/");
+        request.Headers.Add("Referer", $"{_options.BaseUrl.TrimEnd('/')}/app");
         request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
         request.Headers.Add("X-Same-Domain", "1");
 
@@ -394,47 +379,24 @@ public partial class GeminiWebChatService(
     {
         try
         {
-            // Strip the anti-XSRF prefix
-            var cleanedBody = responseBody;
-            if (cleanedBody.StartsWith(")]}'"))
+            var lines = responseBody.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            string lastText = string.Empty;
+
+            foreach (var line in lines)
             {
-                var newlineIndex = cleanedBody.IndexOf('\n');
-                if (newlineIndex >= 0)
+                var trimmed = line.Trim();
+                if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
+                    continue;
+
+                var text = ExtractStreamingText(trimmed);
+                if (!string.IsNullOrEmpty(text))
                 {
-                    cleanedBody = cleanedBody[(newlineIndex + 1)..];
+                    lastText = text;
                 }
             }
 
-            // Parse the outer array structure
-            // Response format: [[["wrb.fr","otAQ7b","[...actual response...]",null,null,null,sequence]]]
-            var outerArray = JsonSerializer.Deserialize<JsonElement>(cleanedBody);
-
-            if (outerArray.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var item in outerArray.EnumerateArray())
-                {
-                    if (item.ValueKind != JsonValueKind.Array) continue;
-
-                    foreach (var innerItem in item.EnumerateArray())
-                    {
-                        if (innerItem.ValueKind != JsonValueKind.Array) continue;
-
-                        // Look for the response with rpcid "otAQ7b"
-                        if (innerItem.GetArrayLength() >= 3)
-                        {
-                            var rpcId = innerItem[1].GetString();
-                            if (rpcId == "otAQ7b")
-                            {
-                                var responseData = innerItem[2].GetString();
-                                if (!string.IsNullOrEmpty(responseData))
-                                {
-                                    return ExtractTextFromResponseData(responseData);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            if (!string.IsNullOrEmpty(lastText))
+                return lastText;
 
             logger.LogWarning("Could not parse batchexecute response structure");
             return string.Empty;
@@ -579,21 +541,41 @@ public partial class GeminiWebChatService(
                             {
                                 if (item.ValueKind != JsonValueKind.Array) continue;
 
+                                // Case 1: 2-level array [[ "wrb.fr", null, "..." ]]
+                                if (item.GetArrayLength() >= 3)
+                                {
+                                    var tag = item[0].ValueKind == JsonValueKind.String ? item[0].GetString() : null;
+                                    var rpcId = item[1].ValueKind == JsonValueKind.String ? item[1].GetString() : null;
+
+                                    if (tag == "wrb.fr" || rpcId == "otAQ7b")
+                                    {
+                                        var responseData = item[2].ValueKind == JsonValueKind.String ? item[2].GetString() : null;
+                                        if (!string.IsNullOrEmpty(responseData))
+                                        {
+                                            var extracted = ExtractTextFromResponseData(responseData);
+                                            if (!string.IsNullOrEmpty(extracted))
+                                                return extracted;
+                                        }
+                                    }
+                                }
+
+                                // Case 2: 3-level array [[[ "wrb.fr", null, "..." ]]]
                                 foreach (var innerItem in item.EnumerateArray())
                                 {
                                     if (innerItem.ValueKind != JsonValueKind.Array) continue;
                                     if (innerItem.GetArrayLength() >= 3)
                                     {
-                                        var rpcId = innerItem[1].ValueKind == JsonValueKind.String
-                                            ? innerItem[1].GetString()
-                                            : null;
+                                        var tag = innerItem[0].ValueKind == JsonValueKind.String ? innerItem[0].GetString() : null;
+                                        var rpcId = innerItem[1].ValueKind == JsonValueKind.String ? innerItem[1].GetString() : null;
 
-                                        if (rpcId == "otAQ7b")
+                                        if (tag == "wrb.fr" || rpcId == "otAQ7b")
                                         {
-                                            var responseData = innerItem[2].GetString();
+                                            var responseData = innerItem[2].ValueKind == JsonValueKind.String ? innerItem[2].GetString() : null;
                                             if (!string.IsNullOrEmpty(responseData))
                                             {
-                                                return ExtractTextFromResponseData(responseData);
+                                                var extracted = ExtractTextFromResponseData(responseData);
+                                                if (!string.IsNullOrEmpty(extracted))
+                                                    return extracted;
                                             }
                                         }
                                     }

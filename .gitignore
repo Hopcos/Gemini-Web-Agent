@@ -389,3 +389,4 @@ FodyWeavers.xsd
 # Appsettings that carry credentials — never commit them.
 **/appsettings.Development.json
 **/appsettings.hopcos.json
+/src/GeminiWebAgent/cookies.json

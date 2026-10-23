@@ -52,4 +52,31 @@ public class BatchExecutePayloadTests
         Assert.Equal("otAQ7b", innerWrapper[0].GetString());
         Assert.Equal("generic", innerWrapper[3].GetString());
     }
+
+    [Fact]
+    public void StreamGenerate_FReqWrapper_HasValidMessageStructure()
+    {
+        var messageStruct = new object?[]
+        {
+            new object?[] { "Hello from Gemini" },
+            null,
+            null
+        };
+
+        var fReq = JsonSerializer.Serialize(new object?[]
+        {
+            null,
+            JsonSerializer.Serialize(messageStruct)
+        });
+
+        var doc = JsonDocument.Parse(fReq);
+        Assert.Equal(JsonValueKind.Array, doc.RootElement.ValueKind);
+        Assert.Equal(2, doc.RootElement.GetArrayLength());
+        Assert.Equal(JsonValueKind.Null, doc.RootElement[0].ValueKind);
+        Assert.Equal(JsonValueKind.String, doc.RootElement[1].ValueKind);
+
+        var innerDoc = JsonDocument.Parse(doc.RootElement[1].GetString()!);
+        Assert.Equal(JsonValueKind.Array, innerDoc.RootElement.ValueKind);
+        Assert.Equal("Hello from Gemini", innerDoc.RootElement[0][0].GetString());
+    }
 }
