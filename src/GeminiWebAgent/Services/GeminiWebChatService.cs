@@ -28,13 +28,20 @@ public partial class GeminiWebChatService(
     public async Task<OpenAIChatCompletionResponse> ChatCompletionAsync(string cookies, OpenAIChatCompletionRequest request)
     {
         var modelConfig = GeminiWebModelMap.GetModelConfig(request.Model);
-        var prompt = BuildPromptFromMessages(request.Messages, modelConfig);
+        var effectiveTools = GetEffectiveTools(request);
+        var prompt = BuildPromptFromMessages(request.Messages, effectiveTools, modelConfig);
         var model = modelConfig.CanonicalName;
 
         var responseText = await SendBatchExecuteAsync(cookies, prompt, modelConfig, stream: false);
         var parsedText = ParseBatchExecuteResponse(responseText);
 
-        return BuildOpenAIResponse(parsedText, model);
+        var (cleanText, toolCalls) = ParseToolCalls(parsedText, effectiveTools);
+        var finishReason = toolCalls != null && toolCalls.Count > 0 ? "tool_calls" : "stop";
+
+        var promptTokens = EstimateTokens(prompt);
+        var completionTokens = EstimateTokens(parsedText);
+
+        return BuildOpenAIResponse(cleanText, toolCalls, finishReason, model, promptTokens, completionTokens);
     }
 
     /// <summary>
@@ -43,7 +50,8 @@ public partial class GeminiWebChatService(
     public async Task StreamChatCompletionAsync(string cookies, OpenAIChatCompletionRequest request, HttpResponse httpResponse)
     {
         var modelConfig = GeminiWebModelMap.GetModelConfig(request.Model);
-        var prompt = BuildPromptFromMessages(request.Messages, modelConfig);
+        var effectiveTools = GetEffectiveTools(request);
+        var prompt = BuildPromptFromMessages(request.Messages, effectiveTools, modelConfig);
         var model = modelConfig.CanonicalName;
 
         var completionId = $"chatcmpl-{Guid.NewGuid():N}";
@@ -51,25 +59,171 @@ public partial class GeminiWebChatService(
 
         try
         {
-            var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
-
-            var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
-            await cookieManager.UpdateFromResponseAsync(response);
-
-            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            // If tools are provided: accumulate full response to parse tool_calls properly
+            if (effectiveTools != null && effectiveTools.Count > 0)
             {
-                logger.LogInformation("Refreshing session and retrying streaming request after 401/403...");
-                sessionService.InvalidateSession();
-                response.Dispose();
+                string lastText = string.Empty;
+                for (var attempt = 1; attempt <= 3; attempt++)
+                {
+                    using var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
+                    using var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
+                    await cookieManager.UpdateFromResponseAsync(response);
 
-                httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
-                response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
-                await cookieManager.UpdateFromResponseAsync(response);
+                    if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
+                         response.StatusCode == System.Net.HttpStatusCode.Forbidden) && attempt == 1)
+                    {
+                        logger.LogInformation("Refreshing session and retrying streaming request after 401/403...");
+                        sessionService.InvalidateSession();
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var errorBody = await response.Content.ReadAsStringAsync();
+                        logger.LogError("Gemini Web streaming error: {StatusCode} - {Body}", response.StatusCode, errorBody);
+
+                        var errorChunk = CreateStreamErrorChunk(model, completionId, $"Gemini Web error: {response.StatusCode}");
+                        await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(errorChunk)}\n\n");
+                        await httpResponse.WriteAsync("data: [DONE]\n\n");
+                        return;
+                    }
+
+                    using var stream = await response.Content.ReadAsStreamAsync();
+                    using var reader = new StreamReader(stream);
+
+                    lastText = string.Empty;
+                    while (await reader.ReadLineAsync() is { } line)
+                    {
+                        var trimmed = line.Trim();
+                        if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
+                            continue;
+
+                        var currentText = ExtractStreamingText(trimmed);
+                        if (!string.IsNullOrEmpty(currentText))
+                        {
+                            lastText = currentText;
+                        }
+                    }
+
+                    if (IsGeminiGlitchResponse(lastText) && attempt < 3)
+                    {
+                        logger.LogWarning("Gemini Web returned temporary glitch response on attempt {Attempt} during tool streaming. Retrying in 500ms...", attempt);
+                        await Task.Delay(500);
+                        continue;
+                    }
+
+                    break;
+                }
+
+                var (cleanText, toolCalls) = ParseToolCalls(lastText, effectiveTools);
+                var finishReason = toolCalls != null && toolCalls.Count > 0 ? "tool_calls" : "stop";
+
+                // 1. If there is explanatory text, emit text chunk first
+                if (!string.IsNullOrEmpty(cleanText))
+                {
+                    var textChunk = new OpenAIChatCompletionResponse
+                    {
+                        Id = completionId,
+                        Object = "chat.completion.chunk",
+                        Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        Model = model,
+                        Choices =
+                        [
+                            new OpenAIChatCompletionChoice
+                            {
+                                Index = 0,
+                                Delta = new OpenAIChoiceDelta
+                                {
+                                    Role = "assistant",
+                                    Content = cleanText
+                                },
+                                FinishReason = null
+                            }
+                        ]
+                    };
+                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(textChunk)}\n\n");
+                    await httpResponse.Body.FlushAsync();
+                }
+
+                // 2. If tools were called, emit tool_calls delta chunk (with Index: 0, 1...)
+                if (toolCalls != null && toolCalls.Count > 0)
+                {
+                    for (var i = 0; i < toolCalls.Count; i++)
+                    {
+                        toolCalls[i].Index = i;
+                    }
+
+                    var toolCallChunk = new OpenAIChatCompletionResponse
+                    {
+                        Id = completionId,
+                        Object = "chat.completion.chunk",
+                        Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        Model = model,
+                        Choices =
+                        [
+                            new OpenAIChatCompletionChoice
+                            {
+                                Index = 0,
+                                Delta = new OpenAIChoiceDelta
+                                {
+                                    Role = string.IsNullOrEmpty(cleanText) ? "assistant" : null,
+                                    ToolCalls = toolCalls
+                                },
+                                FinishReason = null
+                            }
+                        ]
+                    };
+                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(toolCallChunk)}\n\n");
+                    await httpResponse.Body.FlushAsync();
+                }
+
+                // 3. Emit final transition chunk with finish_reason and usage
+                var promptTokens = EstimateTokens(prompt);
+                var completionTokens = EstimateTokens(lastText);
+                var finalToolChunk = new OpenAIChatCompletionResponse
+                {
+                    Id = completionId,
+                    Object = "chat.completion.chunk",
+                    Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Model = model,
+                    Choices =
+                    [
+                        new OpenAIChatCompletionChoice
+                        {
+                            Index = 0,
+                            Delta = new OpenAIChoiceDelta(),
+                            FinishReason = finishReason
+                        }
+                    ],
+                    Usage = new OpenAIUsage
+                    {
+                        PromptTokens = promptTokens,
+                        CompletionTokens = completionTokens,
+                        TotalTokens = promptTokens + completionTokens
+                    }
+                };
+
+                await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(finalToolChunk)}\n\n");
+                await httpResponse.WriteAsync("data: [DONE]\n\n");
+                await httpResponse.Body.FlushAsync();
+                return;
             }
 
-            using (response)
+            // Non-tool streaming path with glitch detection and automatic retry
+            for (var attempt = 1; attempt <= 3; attempt++)
             {
+                using var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
+                using var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
+                await cookieManager.UpdateFromResponseAsync(response);
+
+                if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
+                     response.StatusCode == System.Net.HttpStatusCode.Forbidden) && attempt == 1)
+                {
+                    logger.LogInformation("Refreshing session and retrying streaming request after 401/403...");
+                    sessionService.InvalidateSession();
+                    continue;
+                }
+
                 if (!response.IsSuccessStatusCode)
                 {
                     var errorBody = await response.Content.ReadAsStringAsync();
@@ -81,51 +235,79 @@ public partial class GeminiWebChatService(
                     return;
                 }
 
-            using var stream = await response.Content.ReadAsStreamAsync();
-            using var reader = new StreamReader(stream);
+                using var stream = await response.Content.ReadAsStreamAsync();
+                using var reader = new StreamReader(stream);
 
-            var previousLength = 0;
+                var previousLength = 0;
+                string fullCompletionText = string.Empty;
+                bool detectedGlitch = false;
 
-            while (await reader.ReadLineAsync() is { } line)
-            {
-                var trimmed = line.Trim();
-                if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
-                    continue;
-
-                var currentText = ExtractStreamingText(trimmed);
-                if (!string.IsNullOrEmpty(currentText) && currentText.Length > previousLength)
+                while (await reader.ReadLineAsync() is { } line)
                 {
-                    var deltaText = currentText[previousLength..];
-                    previousLength = currentText.Length;
+                    var trimmed = line.Trim();
+                    if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
+                        continue;
 
-                    var chunk = BuildStreamChunk(deltaText, model, completionId, isFirstChunk);
-                    isFirstChunk = false;
+                    var currentText = ExtractStreamingText(trimmed);
+                    if (string.IsNullOrEmpty(currentText)) continue;
 
-                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
-                    await httpResponse.Body.FlushAsync();
-                }
-            }
-
-            // Send final chunk with finish_reason
-            var finalChunk = new OpenAIChatCompletionResponse
-            {
-                Id = completionId,
-                Object = "chat.completion.chunk",
-                Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                Model = model,
-                Choices =
-                [
-                    new OpenAIChatCompletionChoice
+                    // If the initial stream chunk is a known Gemini Web glitch, intercept before streaming to client
+                    if (isFirstChunk && IsGeminiGlitchResponse(currentText))
                     {
-                        Index = 0,
-                        Delta = new OpenAIChoiceDelta(),
-                        FinishReason = "stop"
+                        detectedGlitch = true;
+                        break;
                     }
-                ]
-            };
-            await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk)}\n\n");
-            await httpResponse.WriteAsync("data: [DONE]\n\n");
-            await httpResponse.Body.FlushAsync();
+
+                    if (currentText.Length > previousLength)
+                    {
+                        var deltaText = currentText[previousLength..];
+                        previousLength = currentText.Length;
+                        fullCompletionText = currentText;
+
+                        var chunk = BuildStreamChunk(deltaText, model, completionId, isFirstChunk);
+                        isFirstChunk = false;
+
+                        await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
+                        await httpResponse.Body.FlushAsync();
+                    }
+                }
+
+                if (detectedGlitch && attempt < 3)
+                {
+                    logger.LogWarning("Gemini Web returned temporary glitch response on attempt {Attempt} during text streaming. Retrying in 500ms...", attempt);
+                    await Task.Delay(500);
+                    continue;
+                }
+
+                // Send final chunk with finish_reason and usage
+                var promptTok = EstimateTokens(prompt);
+                var compTok = EstimateTokens(fullCompletionText);
+                var finalChunk = new OpenAIChatCompletionResponse
+                {
+                    Id = completionId,
+                    Object = "chat.completion.chunk",
+                    Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Model = model,
+                    Choices =
+                    [
+                        new OpenAIChatCompletionChoice
+                        {
+                            Index = 0,
+                            Delta = new OpenAIChoiceDelta(),
+                            FinishReason = "stop"
+                        }
+                    ],
+                    Usage = new OpenAIUsage
+                    {
+                        PromptTokens = promptTok,
+                        CompletionTokens = compTok,
+                        TotalTokens = promptTok + compTok
+                    }
+                };
+                await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk)}\n\n");
+                await httpResponse.WriteAsync("data: [DONE]\n\n");
+                await httpResponse.Body.FlushAsync();
+                return;
             }
         }
         catch (Exception ex)
@@ -140,38 +322,132 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Builds a single text prompt from OpenAI messages, including model persona grounding.
-    /// Handles system, user, and assistant messages.
+    /// Resolves tools from either Tools or legacy Functions property.
     /// </summary>
-    private static string BuildPromptFromMessages(List<OpenAIMessage> messages, GeminiWebModelConfig modelConfig)
+    public static List<OpenAITool>? GetEffectiveTools(OpenAIChatCompletionRequest request)
+    {
+        if (request.Tools != null && request.Tools.Count > 0)
+        {
+            return request.Tools;
+        }
+
+        if (request.Functions != null && request.Functions.Count > 0)
+        {
+            return request.Functions.Select(f => new OpenAITool
+            {
+                Type = "function",
+                Function = f
+            }).ToList();
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Builds a single text prompt from OpenAI messages, including tool definitions and model persona grounding.
+    /// Handles system, user, assistant, and tool messages.
+    /// </summary>
+    public static string BuildPromptFromMessages(List<OpenAIMessage> messages, List<OpenAITool>? tools, GeminiWebModelConfig modelConfig)
     {
         var parts = new List<string>();
 
-        // Model persona grounding
-        parts.Add($"[System Instructions]\nYou are {modelConfig.DisplayName}, Google's {modelConfig.Description}. When asked about your model name or identity, clearly and directly identify yourself as {modelConfig.DisplayName}.");
+        if (tools != null && tools.Count > 0)
+        {
+            var toolDefs = tools.Select(t => new
+            {
+                name = t.Function.Name,
+                description = t.Function.Description,
+                parameters = t.Function.Parameters
+            });
+            var toolsJson = JsonSerializer.Serialize(toolDefs, new JsonSerializerOptions { WriteIndented = true });
+
+            parts.Add(
+                "[System Instructions]\n" +
+                $"You are {modelConfig.DisplayName}, an autonomous AI software engineer embedded in the developer's workspace.\n" +
+                "You have access to the following tools:\n" +
+                toolsJson + "\n\n" +
+                "INSTRUCTIONS FOR TOOL CALLING:\n" +
+                "1. Whenever the user's request requires viewing, inspecting, searching, reading, creating, editing, or modifying files, executing commands, or exploring the project, you MUST invoke the appropriate tool.\n" +
+                "2. The client runtime environment automatically executes your tool calls on your behalf and returns the results to you.\n" +
+                "3. To call a tool, respond with a code block formatted exactly as:\n" +
+                "```tool_call\n" +
+                "{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n" +
+                "```\n" +
+                "4. AUTONOMOUS WORKSPACE EXPLORATION: When asked to add, build, modify, or integrate features, themes, or code, NEVER ask the user what frontend framework, libraries, or configuration files are used. You MUST first use available tools (such as list_files or read_file) to inspect the project structure, package.json, or workspace files autonomously.\n" +
+                "5. DIRECT ACTION: Do NOT output greetings, self-introductions, or announcements of your model identity at the beginning of your responses. Proceed directly to calling the appropriate tools or answering the request."
+            );
+        }
+        else
+        {
+            // Autonomous agent environment grounding for text-based tool callers (DeepSeek Harness, Roo Code, Trae, etc.)
+            parts.Add(
+                "[System Instructions]\n" +
+                $"You are {modelConfig.DisplayName}, Google's {modelConfig.Description}, an autonomous AI software engineer embedded in the developer's workspace and client agent runtime.\n" +
+                "All workspace tools, commands, and environment features (such as pwsh, glob, web_search, file reading, and editing) described in this session are fully available, active, and executed on your behalf by the client runtime.\n" +
+                "CRITICAL OPERATIONAL RULES:\n" +
+                "1. NEVER claim that tools, commands, or local workspace access are restricted, disabled, or unavailable.\n" +
+                "2. When asked to add, build, modify, or integrate features, themes, or code in the workspace: NEVER ask the user for the project structure, framework, or files. Autonomously inspect and modify the workspace using the available tools and commands.\n" +
+                "3. When asked about your model name or identity, clearly and directly identify yourself as " + modelConfig.DisplayName + ".\n" +
+                "4. DIRECT ACTION: Do NOT output greetings, self-introductions, or conversational filler at the start of your responses. Proceed directly to answering the request or executing the necessary actions."
+            );
+        }
 
         foreach (var message in messages)
         {
-            if (message.Content == null) continue;
-
-            var text = message.Content.Value.ValueKind == JsonValueKind.String
-                ? message.Content.Value.GetString() ?? string.Empty
-                : ExtractTextFromContentParts(message.Content.Value);
-
-            if (string.IsNullOrEmpty(text)) continue;
+            var text = message.Content == null
+                ? string.Empty
+                : message.Content.Value.ValueKind == JsonValueKind.String
+                    ? message.Content.Value.GetString() ?? string.Empty
+                    : ExtractTextFromContentParts(message.Content.Value);
 
             switch (message.Role)
             {
                 case "system":
-                    parts.Add($"[System Instructions]\n{text}");
+                    if (!string.IsNullOrEmpty(text))
+                        parts.Add($"[System Instructions]\n{text}");
                     break;
+
                 case "user":
-                    parts.Add(text);
+                    if (!string.IsNullOrEmpty(text))
+                        parts.Add($"[User]\n{text}");
                     break;
+
                 case "assistant":
-                    parts.Add($"[Previous Assistant Response]\n{text}");
+                    var assistantParts = new List<string>();
+                    if (!string.IsNullOrEmpty(text))
+                        assistantParts.Add(text);
+
+                    if (message.ToolCalls != null && message.ToolCalls.Count > 0)
+                    {
+                        foreach (var tc in message.ToolCalls)
+                        {
+                            assistantParts.Add($"```tool_call\n{{\"name\": \"{tc.Function.Name}\", \"arguments\": {tc.Function.Arguments}}}\n```");
+                        }
+                    }
+
+                    if (assistantParts.Count > 0)
+                    {
+                        parts.Add($"[Assistant]\n{string.Join("\n", assistantParts)}");
+                    }
+                    break;
+
+                case "tool":
+                    var toolName = !string.IsNullOrEmpty(message.Name)
+                        ? message.Name
+                        : (!string.IsNullOrEmpty(message.ToolCallId) ? message.ToolCallId : "tool");
+                    parts.Add($"[Tool Result for {toolName}]:\n{text}");
+                    break;
+
+                default:
+                    if (!string.IsNullOrEmpty(text))
+                        parts.Add(text);
                     break;
             }
+        }
+
+        if (messages.Count > 0 && messages[^1].Role == "tool")
+        {
+            parts.Add("Based on the tool results above, proceed with the next step to fulfill the user's request by calling the appropriate tool or completing the task.");
         }
 
         return string.Join("\n\n", parts);
@@ -198,11 +474,24 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
+    /// Detects whether the response from Gemini Web is an internal glitch / canned error message.
+    /// </summary>
+    public static bool IsGeminiGlitchResponse(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        return text.Contains("I encountered an error doing what you asked", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("I seem to be encountering an error", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Sorry, something went wrong", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("I'm having a hard time fulfilling your request", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("An error occurred. Please try again", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// Sends a request to the Gemini Web batchexecute endpoint.
     /// </summary>
     private async Task<string> SendBatchExecuteAsync(string cookies, string prompt, GeminiWebModelConfig modelConfig, bool stream)
     {
-        for (var attempt = 1; attempt <= 2; attempt++)
+        for (var attempt = 1; attempt <= 3; attempt++)
         {
             var request = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream);
 
@@ -212,6 +501,13 @@ public partial class GeminiWebChatService(
 
             if (response.IsSuccessStatusCode)
             {
+                if (attempt < 3 && IsGeminiGlitchResponse(responseBody))
+                {
+                    logger.LogWarning("Gemini Web returned temporary glitch response on attempt {Attempt}. Retrying in 500ms...", attempt);
+                    await Task.Delay(500);
+                    continue;
+                }
+
                 return responseBody;
             }
 
@@ -232,7 +528,10 @@ public partial class GeminiWebChatService(
                 throw new HttpRequestException("Authentication failed. Cookies may be invalid or expired.");
             }
 
-            throw new HttpRequestException($"Gemini Web API error: {response.StatusCode} - {responseBody}");
+            if (attempt == 3)
+            {
+                throw new HttpRequestException($"Gemini Web API error: {response.StatusCode} - {responseBody}");
+            }
         }
 
         throw new HttpRequestException("Failed to send request to Gemini Web after retry.");
@@ -549,11 +848,35 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Builds the final OpenAI-format response from parsed text.
+    /// Estimates token count for text (supports English, CJK, and code).
     /// </summary>
-    private static OpenAIChatCompletionResponse BuildOpenAIResponse(string content, string model)
+    public static int EstimateTokens(string? text)
     {
-        var estimatedTokens = Math.Max(1, content.Length / 4);
+        if (string.IsNullOrEmpty(text)) return 0;
+        int cjkCount = 0;
+        foreach (var c in text)
+        {
+            if (c >= 0x4E00 && c <= 0x9FFF) cjkCount++;
+        }
+        int nonCjk = text.Length - cjkCount;
+        return Math.Max(1, cjkCount + (nonCjk / 4));
+    }
+
+    /// <summary>
+    /// Builds the final OpenAI-format response from parsed text and optional tool calls.
+    /// </summary>
+    private static OpenAIChatCompletionResponse BuildOpenAIResponse(
+        string? content,
+        List<OpenAIToolCall>? toolCalls,
+        string finishReason,
+        string model,
+        int promptTokens = 0,
+        int completionTokens = 0)
+    {
+        if (completionTokens == 0)
+        {
+            completionTokens = Math.Max(1, (content?.Length ?? 0) / 4);
+        }
 
         return new OpenAIChatCompletionResponse
         {
@@ -568,19 +891,147 @@ public partial class GeminiWebChatService(
                     Message = new OpenAIChoiceMessage
                     {
                         Role = "assistant",
-                        Content = content
+                        Content = content,
+                        ToolCalls = toolCalls
                     },
-                    FinishReason = "stop"
+                    FinishReason = finishReason
                 }
             ],
             Usage = new OpenAIUsage
             {
-                PromptTokens = 0,  // Not available from web interface
-                CompletionTokens = estimatedTokens,
-                TotalTokens = estimatedTokens
+                PromptTokens = promptTokens,
+                CompletionTokens = completionTokens,
+                TotalTokens = promptTokens + completionTokens
             }
         };
     }
+
+    /// <summary>
+    /// Parses tool_call codeblocks from model text output.
+    /// </summary>
+    public static (string? CleanText, List<OpenAIToolCall>? ToolCalls) ParseToolCalls(string text, List<OpenAITool>? tools)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return (text, null);
+        }
+
+        var knownTools = tools != null && tools.Count > 0
+            ? new HashSet<string>(tools.Select(t => t.Function.Name), StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var toolCalls = new List<OpenAIToolCall>();
+        var cleanText = text;
+
+        // 1. Try ```tool_call ... ``` or ```json ... ``` blocks
+        var matches = CodeBlockRegex().Matches(text);
+        foreach (Match match in matches)
+        {
+            var blockContent = match.Groups[1].Value.Trim();
+            if (TryParseToolCallJson(blockContent, knownTools, out var call))
+            {
+                toolCalls.Add(call);
+                cleanText = cleanText.Replace(match.Value, string.Empty);
+            }
+        }
+
+        // 2. Try XML-style <tool_call>...</tool_call>
+        var xmlMatches = XmlToolCallRegex().Matches(cleanText);
+        foreach (Match match in xmlMatches)
+        {
+            var blockContent = match.Groups[1].Value.Trim();
+            if (TryParseToolCallJson(blockContent, knownTools, out var call))
+            {
+                toolCalls.Add(call);
+                cleanText = cleanText.Replace(match.Value, string.Empty);
+            }
+        }
+
+        // 3. Fallback: if no blocks matched, check if entire response is a JSON tool call
+        if (toolCalls.Count == 0 && cleanText.TrimStart().StartsWith('{'))
+        {
+            if (TryParseToolCallJson(cleanText.Trim(), knownTools, out var call))
+            {
+                toolCalls.Add(call);
+                cleanText = null;
+            }
+        }
+
+        if (toolCalls.Count > 0)
+        {
+            for (var i = 0; i < toolCalls.Count; i++)
+            {
+                toolCalls[i].Index = i;
+            }
+        }
+
+        var trimmed = cleanText?.Trim();
+        var finalContent = string.IsNullOrEmpty(trimmed) ? null : trimmed;
+
+        return (finalContent, toolCalls.Count > 0 ? toolCalls : null);
+    }
+
+    private static bool TryParseToolCallJson(string jsonStr, HashSet<string> knownTools, out OpenAIToolCall call)
+    {
+        call = new OpenAIToolCall();
+        try
+        {
+            using var doc = JsonDocument.Parse(jsonStr);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+
+            string? name = null;
+            if (root.TryGetProperty("name", out var nameProp) && nameProp.ValueKind == JsonValueKind.String)
+            {
+                name = nameProp.GetString();
+            }
+            else if (root.TryGetProperty("function", out var fnProp) && fnProp.ValueKind == JsonValueKind.Object &&
+                     fnProp.TryGetProperty("name", out var fnNameProp) && fnNameProp.ValueKind == JsonValueKind.String)
+            {
+                name = fnNameProp.GetString();
+            }
+
+            if (string.IsNullOrEmpty(name)) return false;
+
+            if (knownTools.Count > 0 && !knownTools.Contains(name))
+            {
+                return false;
+            }
+
+            string argumentsStr = "{}";
+            if (root.TryGetProperty("arguments", out var argsProp))
+            {
+                argumentsStr = argsProp.ValueKind == JsonValueKind.String
+                    ? argsProp.GetString() ?? "{}"
+                    : argsProp.GetRawText();
+            }
+            else if (root.TryGetProperty("parameters", out var paramsProp))
+            {
+                argumentsStr = paramsProp.ValueKind == JsonValueKind.String
+                    ? paramsProp.GetString() ?? "{}"
+                    : paramsProp.GetRawText();
+            }
+
+            call.Id = $"call_{Guid.NewGuid():N}"[..12];
+            call.Type = "function";
+            call.Function = new OpenAIToolCallFunction
+            {
+                Name = name,
+                Arguments = argumentsStr
+            };
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    [GeneratedRegex(@"```(?:tool_call|json)?\s*\n?(.*?)\n?```", RegexOptions.Singleline)]
+    private static partial Regex CodeBlockRegex();
+
+    [GeneratedRegex(@"<tool_call>\s*(.*?)\s*</tool_call>", RegexOptions.Singleline)]
+    private static partial Regex XmlToolCallRegex();
 
     /// <summary>
     /// Builds a streaming chunk response.

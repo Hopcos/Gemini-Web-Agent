@@ -46,7 +46,11 @@ public class OpenAIChoiceMessage
     public string Role { get; set; } = "assistant";
 
     [JsonPropertyName("content")]
-    public string Content { get; set; } = string.Empty;
+    public string? Content { get; set; }
+
+    [JsonPropertyName("tool_calls")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<OpenAIToolCall>? ToolCalls { get; set; }
 }
 
 public class OpenAIChoiceDelta
@@ -58,6 +62,10 @@ public class OpenAIChoiceDelta
     [JsonPropertyName("content")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; set; }
+
+    [JsonPropertyName("tool_calls")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<OpenAIToolCall>? ToolCalls { get; set; }
 }
 
 public class OpenAIUsage

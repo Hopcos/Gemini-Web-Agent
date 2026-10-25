@@ -25,6 +25,24 @@ public class OpenAIChatCompletionRequest
 
     [JsonPropertyName("stop")]
     public List<string>? Stop { get; set; }
+
+    [JsonPropertyName("tools")]
+    public List<OpenAITool>? Tools { get; set; }
+
+    [JsonPropertyName("tool_choice")]
+    public object? ToolChoice { get; set; }
+
+    [JsonPropertyName("functions")]
+    public List<OpenAIToolFunction>? Functions { get; set; }
+
+    [JsonPropertyName("stream_options")]
+    public OpenAIStreamOptions? StreamOptions { get; set; }
+}
+
+public class OpenAIStreamOptions
+{
+    [JsonPropertyName("include_usage")]
+    public bool IncludeUsage { get; set; }
 }
 
 public class OpenAIMessage
@@ -34,6 +52,62 @@ public class OpenAIMessage
 
     [JsonPropertyName("content")]
     public JsonElement? Content { get; set; }
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("tool_call_id")]
+    public string? ToolCallId { get; set; }
+
+    [JsonPropertyName("tool_calls")]
+    public List<OpenAIToolCall>? ToolCalls { get; set; }
+}
+
+public class OpenAITool
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "function";
+
+    [JsonPropertyName("function")]
+    public OpenAIToolFunction Function { get; set; } = new();
+}
+
+public class OpenAIToolFunction
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+
+    [JsonPropertyName("parameters")]
+    public JsonElement? Parameters { get; set; }
+}
+
+public class OpenAIToolCall
+{
+    [JsonPropertyName("index")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Index { get; set; }
+
+    [JsonPropertyName("id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Id { get; set; }
+
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "function";
+
+    [JsonPropertyName("function")]
+    public OpenAIToolCallFunction Function { get; set; } = new();
+}
+
+public class OpenAIToolCallFunction
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("arguments")]
+    public string Arguments { get; set; } = "{}";
 }
 
 public class OpenAIContentPart

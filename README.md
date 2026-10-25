@@ -51,6 +51,40 @@ flowchart TD
 - **Native AOT 友好与纯官方库**：无需依赖任何第三方非官方封装库，100% 采用官方 `System.Text.Json`、`IHttpClientFactory` 及现代 C# 特性（Primary Constructors、Collection Expressions `[]`、Generated Regex 等）。
 - **零警告 (0 Warnings) 严苛构建**：Nullable Reference Types 全面启用，代码健壮规范。
 
+### 4. 🛠️ OpenAI Tool Calling / Function Calling 双向转译 (Agent 编程助手原生支持)
+
+> [!IMPORTANT]
+> **排坑经验沉淀：解决 Coding Agent 接入时的“模型拒绝修改本地文件”痛点**
+> 
+> 在将普通 Web 代理接入本地编程 Agent（如 Cursor、Cline、Roo Code、Aider、LiveConversation Agent 等）时，经常会遇到以下现象：
+> 外部 Agent 期望模型自动修改代码，但模型却输出长篇大论的建议，被催促“直接修改文件”时甚至道歉拒绝：
+> *“作为纯文本交互的 AI 语言模型，我并没有直接挂载或访问您本地计算机物理文件系统的权限，因此我无法在您的电脑上直接执行文件覆盖或修改。请手动复制上述代码到 VS Code 中替换……”*
+
+#### 💡 深度机理与排坑经验
+1. **云端模型并不物理读写本地磁盘**：任何商业 API（如 Claude 3.5 Sonnet、GPT-4o、Gemini 官方 API）在配合 Agent 修改代码时，模型本身**从来不会**直接访问用户的物理文件系统。其背后的本质是标准 **OpenAI Function Calling（工具调用）协议**——客户端在请求中下发 `tools: [...]`（如 `read_file`、`write_to_file` 等本地工具定义），模型依据逻辑计算在响应中返回结构化的 `tool_calls` 参数块（`finish_reason: "tool_calls"`），再由**运行在用户电脑上的 Agent 宿主程序**完成磁盘 IO。
+2. **传统 Web 代理的技术盲区**：
+   - **`tools` 契约静默丢弃**：绝大多数反代未定义 `tools`/`functions` 接收属性，导致客户端发送的工具声明在 JSON 反序列化时被全部丢失；
+   - **多轮会话断裂**：未对 `role: "tool"`（工具执行结果）及 `tool_call_id` 进行适配，Agent 执行完工具后的回执请求直接报错或失真；
+   - **纯文本人设误导**：若网关在提示词中固定注入纯文本闲聊身份，模型在感知不到任何工具的情况下面对用户“直接修改本地文件”的要求，只能给出严谨但无用的免责道歉；
+   - **负面暗示陷阱**：如果在系统提示词中写入“禁止回答无法访问文件”，反而会触发 LLM 负向提示词聚焦效应（Pink Elephant Effect），诱发模型反复复读拒绝语句。
+
+#### 🚀 GeminiWebAgent 的双向转译解决方案
+GeminiWebAgent 在底层原生打通了 OpenAI Tool Calling 规范：
+- **全契约双向透传**：支持 OpenAI 标准 `tools`、`functions`、`tool_choice`、`tool_calls`、`tool_call_id` 及 `role: "tool"` 消息。
+- **Agent 宿主环境正向引导与自主工程探索**：在包含工具的请求中，自动将客户端提供的 JSON Schema 工具定义与交互协议编译为结构化指令，明确指导模型在承接功能实现任务时，主动调用 `list_files` 或 `read_file` 探测工程目录与配置文件（如 `package.json`），禁止反问用户技术栈或输出身份冗余废话。
+- **多轮工具回执持续执行 (Tool Continuation)**：针对 Agent 提交的 `role: "tool"` 运行结果，自动衔接下一步执行指令，驱动模型实现多轮多工具（如并行读取多文件、写回修改）的自主迭代循环。
+- **DeepSeek Harness / 文本工具模式自适应赋能**：
+  - 针对 DeepSeek Harness (`dsh`)、Roo Code 等在系统提示词中声明指令（如 `pwsh`、`glob`、`web_search` 等）而未在请求体下发 JSON `tools` 字段的场景，网关自适应注入嵌入式智能体运行态指令；
+  - 严正告知模型宿主环境指令处于完全可用状态，彻底根除模型输出 *"与标准 DeepSeek Harness 智能体工作区指令（如 pwsh、glob、web_search 等）在此对话层并未直接开放或已被限制"* 的认知偏差；
+  - 驱动模型在承接功能创建/修改指令时，主动通过 `glob` 或 `pwsh` 巡检当前工程，杜绝向用户反复索要文件路径或技术栈。
+- **严格符合 OpenAI 规范的流式 SSE 分块 (修复 Client Agent 崩溃)**：
+  - **强制包含 `index` 属性**：在 `delta.tool_calls` 数组中严格注入 `index: 0, 1, 2...`，彻底解决 Cline / Roo Code 等客户端解析器因缺少 `index` 抛出 `TypeError: Cannot read properties of undefined` 并报错 *“I encountered an error doing what you asked”* 的兼容性缺陷；
+  - **规范的两阶段流式状态转移**：第一阶段下发工具参数与 `finish_reason: null`，第二阶段下发带 `finish_reason: "tool_calls"` 与 `usage` 的终态分块，确保 Agent 状态机平稳切换；
+  - **真实 Token 估算统计**：中英文多模态精确估算 `Usage`（`prompt_tokens`, `completion_tokens`, `total_tokens`），告别客户端 UI 显示 `用量 0 tok` 的困扰；
+  - **云端全量毛刺智能拦截重试 (Glitch Auto-Recovery)**：
+    - 全面捕获 Gemini Web 各类瞬态模板报错（如 *"I encountered an error doing what you asked"*、*"I seem to be encountering an error. Can I try something else for you?"*、*"Sorry, something went wrong"*、*"I'm having a hard time fulfilling your request"* 等）；
+    - 在非流式与流式下发前实施静默拦截并启动指数退避自动重试（最多 3 次），杜绝报错信息污染客户端 Agent 对话流。
+
 ---
 
 ## 🔀 支持模型列表
@@ -222,6 +256,74 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
+### 6. 工具调用 / Function Calling 示例 (Agent 读写本地文件场景)
+
+```bash
+curl http://127.0.0.1:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_COOKIES" \
+  -d '{
+    "model": "gemini-4-argon",
+    "messages": [
+      {
+        "role": "user",
+        "content": "请查看本地文件 E:/Personal/LiveConversation/test.txt 并告诉我它的内容"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "读取本地工作区中的文件内容",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "文件的绝对或相对路径" }
+            },
+            "required": ["path"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
+响应体（完全符合 OpenAI 官方规范）：
+```json
+{
+  "id": "chatcmpl-bc4eeb6faed9418dbd67895f05214574",
+  "object": "chat.completion",
+  "created": 1792855666,
+  "model": "gemini-4-argon",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_12345678",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"E:/Personal/LiveConversation/test.txt\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 30,
+    "total_tokens": 30
+  }
+}
+```
+
 ---
 
 ## 📁 项目工程目录
@@ -258,13 +360,15 @@ E:\Personal\GeminiWebAgent\
 │   │   ├── GeminiWeb/
 │   │   │   └── GeminiWebModels.cs                # 会话与模型映射字典
 │   │   └── OpenAI/
-│   │       ├── OpenAIChatCompletionRequest.cs    # OpenAI 请求契约 DTO
-│   │       ├── OpenAIChatCompletionResponse.cs   # OpenAI 响应与流式契约 DTO
+│   │       ├── OpenAIChatCompletionRequest.cs    # OpenAI 请求契约 DTO (含 Tools/Functions)
+│   │       ├── OpenAIChatCompletionResponse.cs   # OpenAI 响应契约 DTO (含 ToolCalls)
 │   │       └── OpenAIModelResponse.cs            # OpenAI 模型列表契约 DTO
 │   ├── Properties/
 │   │   └── launchSettings.json                   # 调试启动配置
 │   └── Services/
-│       ├── GeminiWebChatService.cs               # batchexecute 核心对话与流式转译服务
+│       ├── CookieKeepAliveBackgroundService.cs   # Cookie 后台保活巡检后台服务
+│       ├── GeminiWebChatService.cs               # batchexecute 对话、流式与 Tool Calling 转译服务
+│       ├── GeminiWebCookieManager.cs             # 滚动 Cookie 拦截与持久化管理器
 │       ├── GeminiWebModelService.cs              # 模型查询服务
 │       └── GeminiWebSessionService.cs            # 动态会话参数与构建标识提取服务
 └── tests/GeminiWebAgent.Tests/                   # 自动化测试项目
@@ -273,9 +377,11 @@ E:\Personal\GeminiWebAgent\
     │   └── GatewayLiveTests.cs                   # 端到端存活与鉴权测试
     └── UnitTests/
         ├── BatchExecutePayloadTests.cs           # 报文编解码与前缀剥离单元测试
+        ├── GeminiWebCookieManagerTests.cs        # Cookie 管理与滚动更新单元测试
         ├── GeminiWebModelMapTests.cs             # 模型映射与别名单元测试
         ├── GeminiWebSessionExtractionTests.cs    # 正则提取与参数匹配单元测试
-        └── OpenAIContractsTests.cs               # OpenAI 契约序列化单元测试
+        ├── OpenAIContractsTests.cs               # OpenAI 契约序列化单元测试
+        └── ToolCallingTests.cs                   # Tool Calling 双向解析与提示词单元测试
 ```
 
 ---
@@ -290,7 +396,7 @@ E:\Personal\GeminiWebAgent\
 
 执行结果：
 ```
-已通过! - 失败: 0，通过: 36，已跳过: 0，总计: 36，持续时间: 6 s - GeminiWebAgent.Tests.dll (net10.0)
+已通过! - 失败: 0，通过: 45，已跳过: 0，总计: 45，持续时间: 25 s - GeminiWebAgent.Tests.dll (net10.0)
 ==========================================================
    ALL .NET 10 TESTS PASSED SUCCESSFULLY! (100% PASS)    
 ==========================================================
