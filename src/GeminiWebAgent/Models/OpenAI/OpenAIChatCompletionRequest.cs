@@ -24,6 +24,7 @@ public class OpenAIChatCompletionRequest
     public bool Stream { get; set; }
 
     [JsonPropertyName("stop")]
+    [JsonConverter(typeof(StringOrStringListConverter))]
     public List<string>? Stop { get; set; }
 
     [JsonPropertyName("tools")]
@@ -107,6 +108,7 @@ public class OpenAIToolCallFunction
     public string Name { get; set; } = string.Empty;
 
     [JsonPropertyName("arguments")]
+    [JsonConverter(typeof(JsonArgumentsConverter))]
     public string Arguments { get; set; } = "{}";
 }
 

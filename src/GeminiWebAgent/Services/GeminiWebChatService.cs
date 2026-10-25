@@ -22,6 +22,8 @@ public partial class GeminiWebChatService(
 {
     private readonly GeminiWebOptions _options = options.Value;
 
+    private const int MaxUpstreamAttempts = 3;
+
     /// <summary>
     /// Non-streaming chat completion.
     /// </summary>
@@ -31,9 +33,9 @@ public partial class GeminiWebChatService(
         var effectiveTools = GetEffectiveTools(request);
         var prompt = BuildPromptFromMessages(request.Messages, effectiveTools, modelConfig);
         var model = modelConfig.CanonicalName;
+        LogRequest(request, effectiveTools, prompt, model);
 
-        var responseText = await SendBatchExecuteAsync(cookies, prompt, modelConfig, stream: false);
-        var parsedText = ParseBatchExecuteResponse(responseText);
+        var parsedText = await GenerateWithRetryAsync(cookies, prompt, modelConfig);
 
         var (cleanText, toolCalls) = ParseToolCalls(parsedText, effectiveTools);
         var finishReason = toolCalls != null && toolCalls.Count > 0 ? "tool_calls" : "stop";
@@ -53,96 +55,24 @@ public partial class GeminiWebChatService(
         var effectiveTools = GetEffectiveTools(request);
         var prompt = BuildPromptFromMessages(request.Messages, effectiveTools, modelConfig);
         var model = modelConfig.CanonicalName;
+        LogRequest(request, effectiveTools, prompt, model);
 
         var completionId = $"chatcmpl-{Guid.NewGuid():N}";
-        var isFirstChunk = true;
 
         try
         {
-            // If tools are provided: accumulate full response to parse tool_calls properly
+            // If tools are provided: accumulate the full response so tool_calls can be parsed properly
             if (effectiveTools != null && effectiveTools.Count > 0)
             {
-                string lastText = string.Empty;
-                for (var attempt = 1; attempt <= 3; attempt++)
-                {
-                    using var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
-                    using var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
-                    await cookieManager.UpdateFromResponseAsync(response);
+                var fullText = await GenerateWithRetryAsync(cookies, prompt, modelConfig);
 
-                    if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                         response.StatusCode == System.Net.HttpStatusCode.Forbidden) && attempt == 1)
-                    {
-                        logger.LogInformation("Refreshing session and retrying streaming request after 401/403...");
-                        sessionService.InvalidateSession();
-                        continue;
-                    }
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        var errorBody = await response.Content.ReadAsStringAsync();
-                        logger.LogError("Gemini Web streaming error: {StatusCode} - {Body}", response.StatusCode, errorBody);
-
-                        var errorChunk = CreateStreamErrorChunk(model, completionId, $"Gemini Web error: {response.StatusCode}");
-                        await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(errorChunk)}\n\n");
-                        await httpResponse.WriteAsync("data: [DONE]\n\n");
-                        return;
-                    }
-
-                    using var stream = await response.Content.ReadAsStreamAsync();
-                    using var reader = new StreamReader(stream);
-
-                    lastText = string.Empty;
-                    while (await reader.ReadLineAsync() is { } line)
-                    {
-                        var trimmed = line.Trim();
-                        if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
-                            continue;
-
-                        var currentText = ExtractStreamingText(trimmed);
-                        if (!string.IsNullOrEmpty(currentText))
-                        {
-                            lastText = currentText;
-                        }
-                    }
-
-                    if (IsGeminiGlitchResponse(lastText) && attempt < 3)
-                    {
-                        logger.LogWarning("Gemini Web returned temporary glitch response on attempt {Attempt} during tool streaming. Retrying in 500ms...", attempt);
-                        await Task.Delay(500);
-                        continue;
-                    }
-
-                    break;
-                }
-
-                var (cleanText, toolCalls) = ParseToolCalls(lastText, effectiveTools);
+                var (cleanText, toolCalls) = ParseToolCalls(fullText, effectiveTools);
                 var finishReason = toolCalls != null && toolCalls.Count > 0 ? "tool_calls" : "stop";
 
                 // 1. If there is explanatory text, emit text chunk first
                 if (!string.IsNullOrEmpty(cleanText))
                 {
-                    var textChunk = new OpenAIChatCompletionResponse
-                    {
-                        Id = completionId,
-                        Object = "chat.completion.chunk",
-                        Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        Model = model,
-                        Choices =
-                        [
-                            new OpenAIChatCompletionChoice
-                            {
-                                Index = 0,
-                                Delta = new OpenAIChoiceDelta
-                                {
-                                    Role = "assistant",
-                                    Content = cleanText
-                                },
-                                FinishReason = null
-                            }
-                        ]
-                    };
-                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(textChunk)}\n\n");
-                    await httpResponse.Body.FlushAsync();
+                    await WriteSseAsync(httpResponse, BuildStreamChunk(cleanText, model, completionId, isFirstChunk: true));
                 }
 
                 // 2. If tools were called, emit tool_calls delta chunk (with Index: 0, 1...)
@@ -173,152 +103,99 @@ public partial class GeminiWebChatService(
                             }
                         ]
                     };
-                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(toolCallChunk)}\n\n");
-                    await httpResponse.Body.FlushAsync();
+                    await WriteSseAsync(httpResponse, toolCallChunk);
                 }
 
                 // 3. Emit final transition chunk with finish_reason and usage
-                var promptTokens = EstimateTokens(prompt);
-                var completionTokens = EstimateTokens(lastText);
-                var finalToolChunk = new OpenAIChatCompletionResponse
-                {
-                    Id = completionId,
-                    Object = "chat.completion.chunk",
-                    Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    Model = model,
-                    Choices =
-                    [
-                        new OpenAIChatCompletionChoice
-                        {
-                            Index = 0,
-                            Delta = new OpenAIChoiceDelta(),
-                            FinishReason = finishReason
-                        }
-                    ],
-                    Usage = new OpenAIUsage
-                    {
-                        PromptTokens = promptTokens,
-                        CompletionTokens = completionTokens,
-                        TotalTokens = promptTokens + completionTokens
-                    }
-                };
-
-                await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(finalToolChunk)}\n\n");
-                await httpResponse.WriteAsync("data: [DONE]\n\n");
-                await httpResponse.Body.FlushAsync();
+                await WriteSseAsync(httpResponse, BuildFinalChunk(model, completionId, finishReason, prompt, fullText));
+                await WriteDoneAsync(httpResponse);
                 return;
             }
 
-            // Non-tool streaming path with glitch detection and automatic retry
-            for (var attempt = 1; attempt <= 3; attempt++)
+            // Plain text streaming: deltas are forwarded as soon as upstream produces them.
+            // Glitch / empty upstream replies are retried before the first delta is written.
+            var previousLength = 0;
+            var isFirstChunk = true;
+
+            var text = await GenerateWithRetryAsync(cookies, prompt, modelConfig, async snapshot =>
             {
-                using var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
-                using var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
-                await cookieManager.UpdateFromResponseAsync(response);
+                if (snapshot.Length <= previousLength) return;
 
-                if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                     response.StatusCode == System.Net.HttpStatusCode.Forbidden) && attempt == 1)
-                {
-                    logger.LogInformation("Refreshing session and retrying streaming request after 401/403...");
-                    sessionService.InvalidateSession();
-                    continue;
-                }
+                var deltaText = snapshot[previousLength..];
+                previousLength = snapshot.Length;
 
-                if (!response.IsSuccessStatusCode)
-                {
-                    var errorBody = await response.Content.ReadAsStringAsync();
-                    logger.LogError("Gemini Web streaming error: {StatusCode} - {Body}", response.StatusCode, errorBody);
+                await WriteSseAsync(httpResponse, BuildStreamChunk(deltaText, model, completionId, isFirstChunk));
+                isFirstChunk = false;
+            });
 
-                    var errorChunk = CreateStreamErrorChunk(model, completionId, $"Gemini Web error: {response.StatusCode}");
-                    await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(errorChunk)}\n\n");
-                    await httpResponse.WriteAsync("data: [DONE]\n\n");
-                    return;
-                }
-
-                using var stream = await response.Content.ReadAsStreamAsync();
-                using var reader = new StreamReader(stream);
-
-                var previousLength = 0;
-                string fullCompletionText = string.Empty;
-                bool detectedGlitch = false;
-
-                while (await reader.ReadLineAsync() is { } line)
-                {
-                    var trimmed = line.Trim();
-                    if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
-                        continue;
-
-                    var currentText = ExtractStreamingText(trimmed);
-                    if (string.IsNullOrEmpty(currentText)) continue;
-
-                    // If the initial stream chunk is a known Gemini Web glitch, intercept before streaming to client
-                    if (isFirstChunk && IsGeminiGlitchResponse(currentText))
-                    {
-                        detectedGlitch = true;
-                        break;
-                    }
-
-                    if (currentText.Length > previousLength)
-                    {
-                        var deltaText = currentText[previousLength..];
-                        previousLength = currentText.Length;
-                        fullCompletionText = currentText;
-
-                        var chunk = BuildStreamChunk(deltaText, model, completionId, isFirstChunk);
-                        isFirstChunk = false;
-
-                        await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
-                        await httpResponse.Body.FlushAsync();
-                    }
-                }
-
-                if (detectedGlitch && attempt < 3)
-                {
-                    logger.LogWarning("Gemini Web returned temporary glitch response on attempt {Attempt} during text streaming. Retrying in 500ms...", attempt);
-                    await Task.Delay(500);
-                    continue;
-                }
-
-                // Send final chunk with finish_reason and usage
-                var promptTok = EstimateTokens(prompt);
-                var compTok = EstimateTokens(fullCompletionText);
-                var finalChunk = new OpenAIChatCompletionResponse
-                {
-                    Id = completionId,
-                    Object = "chat.completion.chunk",
-                    Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    Model = model,
-                    Choices =
-                    [
-                        new OpenAIChatCompletionChoice
-                        {
-                            Index = 0,
-                            Delta = new OpenAIChoiceDelta(),
-                            FinishReason = "stop"
-                        }
-                    ],
-                    Usage = new OpenAIUsage
-                    {
-                        PromptTokens = promptTok,
-                        CompletionTokens = compTok,
-                        TotalTokens = promptTok + compTok
-                    }
-                };
-                await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk)}\n\n");
-                await httpResponse.WriteAsync("data: [DONE]\n\n");
-                await httpResponse.Body.FlushAsync();
-                return;
-            }
+            await WriteSseAsync(httpResponse, BuildFinalChunk(model, completionId, "stop", prompt, text));
+            await WriteDoneAsync(httpResponse);
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Error during streaming chat completion");
+            var (statusCode, message, code) = GeminiWebUpstreamException.Describe(ex);
 
-            var errorChunk = CreateStreamErrorChunk(model, completionId, ex.Message);
-            await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(errorChunk)}\n\n");
-            await httpResponse.WriteAsync("data: [DONE]\n\n");
-            await httpResponse.Body.FlushAsync();
+            if (!httpResponse.HasStarted)
+            {
+                // Nothing has been sent yet: answer with a real HTTP error so the client can retry / surface it.
+                httpResponse.StatusCode = statusCode;
+                httpResponse.ContentType = "application/json";
+                await httpResponse.WriteAsJsonAsync(new { error = new { message, type = "upstream_error", code } });
+                return;
+            }
+
+            await WriteSseAsync(httpResponse, CreateStreamErrorChunk(model, completionId, message));
+            await WriteDoneAsync(httpResponse);
         }
+    }
+
+    private void LogRequest(OpenAIChatCompletionRequest request, List<OpenAITool>? tools, string prompt, string model)
+    {
+        logger.LogInformation(
+            "Chat request: model={Model} stream={Stream} messages={Messages} tools={Tools} promptChars={PromptChars} lastRole={LastRole}",
+            model, request.Stream, request.Messages.Count, tools?.Count ?? 0, prompt.Length, request.Messages.LastOrDefault()?.Role);
+    }
+
+    private static async Task WriteSseAsync(HttpResponse httpResponse, OpenAIChatCompletionResponse chunk)
+    {
+        await httpResponse.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
+        await httpResponse.Body.FlushAsync();
+    }
+
+    private static async Task WriteDoneAsync(HttpResponse httpResponse)
+    {
+        await httpResponse.WriteAsync("data: [DONE]\n\n");
+        await httpResponse.Body.FlushAsync();
+    }
+
+    private static OpenAIChatCompletionResponse BuildFinalChunk(string model, string completionId, string finishReason, string prompt, string completionText)
+    {
+        var promptTokens = EstimateTokens(prompt);
+        var completionTokens = EstimateTokens(completionText);
+
+        return new OpenAIChatCompletionResponse
+        {
+            Id = completionId,
+            Object = "chat.completion.chunk",
+            Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            Model = model,
+            Choices =
+            [
+                new OpenAIChatCompletionChoice
+                {
+                    Index = 0,
+                    Delta = new OpenAIChoiceDelta(),
+                    FinishReason = finishReason
+                }
+            ],
+            Usage = new OpenAIUsage
+            {
+                PromptTokens = promptTokens,
+                CompletionTokens = completionTokens,
+                TotalTokens = promptTokens + completionTokens
+            }
+        };
     }
 
     /// <summary>
@@ -350,6 +227,7 @@ public partial class GeminiWebChatService(
     public static string BuildPromptFromMessages(List<OpenAIMessage> messages, List<OpenAITool>? tools, GeminiWebModelConfig modelConfig)
     {
         var parts = new List<string>();
+        var conversation = SanitizeMessages(messages);
 
         if (tools != null && tools.Count > 0)
         {
@@ -374,35 +252,46 @@ public partial class GeminiWebChatService(
                 "{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n" +
                 "```\n" +
                 "4. AUTONOMOUS WORKSPACE EXPLORATION: When asked to add, build, modify, or integrate features, themes, or code, NEVER ask the user what frontend framework, libraries, or configuration files are used. You MUST first use available tools (such as list_files or read_file) to inspect the project structure, package.json, or workspace files autonomously.\n" +
-                "5. DIRECT ACTION: Do NOT output greetings, self-introductions, or announcements of your model identity at the beginning of your responses. Proceed directly to calling the appropriate tools or answering the request."
+                "5. DIRECT ACTION: Do NOT output greetings, self-introductions, or announcements of your model identity at the beginning of your responses. Proceed directly to calling the appropriate tools or answering the request.\n" +
+                "6. Always provide every required argument of the tool you call.\n" +
+                "7. A file is only created, modified or a command only run once a [Tool Result ...] in this conversation confirms it. Never state or imply otherwise.\n" +
+                "8. Reply to the latest message in the conversation; earlier turns are context only."
+            );
+        }
+        else if (conversation.Any(m => m.Role is "system" or "developer" && GetMessageText(m).Length > 0))
+        {
+            // The client's own system prompt defines the (text based) tool protocol. Stay out of its way:
+            // only point at it and keep the model honest, instead of asserting capabilities of our own.
+            parts.Add(
+                "[System Instructions]\n" +
+                $"You are {modelConfig.DisplayName}, Google's {modelConfig.Description}, acting as the assistant of the client application described in the instructions that follow.\n" +
+                "Those instructions define the tools, commands and output format available in this session. The client application executes them for you and sends the results back as later messages.\n" +
+                "RULES:\n" +
+                "1. Follow the client's instructions exactly, including the exact syntax they require for calling tools.\n" +
+                "2. Inspect the workspace with the client's tools instead of asking the user for information you can discover yourself.\n" +
+                "3. Only report that a file was changed or a command was run once a tool result in this conversation confirms it.\n" +
+                "4. When asked about your model name or identity, answer that you are " + modelConfig.DisplayName + ".\n" +
+                "5. Reply to the latest message in the conversation without greetings or self-introduction; earlier turns are context only."
             );
         }
         else
         {
-            // Autonomous agent environment grounding for text-based tool callers (DeepSeek Harness, Roo Code, Trae, etc.)
             parts.Add(
                 "[System Instructions]\n" +
-                $"You are {modelConfig.DisplayName}, Google's {modelConfig.Description}, an autonomous AI software engineer embedded in the developer's workspace and client agent runtime.\n" +
-                "All workspace tools, commands, and environment features (such as pwsh, glob, web_search, file reading, and editing) described in this session are fully available, active, and executed on your behalf by the client runtime.\n" +
-                "CRITICAL OPERATIONAL RULES:\n" +
-                "1. NEVER claim that tools, commands, or local workspace access are restricted, disabled, or unavailable.\n" +
-                "2. When asked to add, build, modify, or integrate features, themes, or code in the workspace: NEVER ask the user for the project structure, framework, or files. Autonomously inspect and modify the workspace using the available tools and commands.\n" +
-                "3. When asked about your model name or identity, clearly and directly identify yourself as " + modelConfig.DisplayName + ".\n" +
-                "4. DIRECT ACTION: Do NOT output greetings, self-introductions, or conversational filler at the start of your responses. Proceed directly to answering the request or executing the necessary actions."
+                $"You are {modelConfig.DisplayName}, Google's {modelConfig.Description}. " +
+                "Reply to the latest message in the conversation directly; earlier turns are context only. " +
+                "You cannot access the user's files or run commands in this conversation, so never claim to have done so."
             );
         }
 
-        foreach (var message in messages)
+        foreach (var message in conversation)
         {
-            var text = message.Content == null
-                ? string.Empty
-                : message.Content.Value.ValueKind == JsonValueKind.String
-                    ? message.Content.Value.GetString() ?? string.Empty
-                    : ExtractTextFromContentParts(message.Content.Value);
+            var text = GetMessageText(message);
 
             switch (message.Role)
             {
                 case "system":
+                case "developer":
                     if (!string.IsNullOrEmpty(text))
                         parts.Add($"[System Instructions]\n{text}");
                     break;
@@ -421,7 +310,7 @@ public partial class GeminiWebChatService(
                     {
                         foreach (var tc in message.ToolCalls)
                         {
-                            assistantParts.Add($"```tool_call\n{{\"name\": \"{tc.Function.Name}\", \"arguments\": {tc.Function.Arguments}}}\n```");
+                            assistantParts.Add($"```tool_call\n{{\"name\": \"{tc.Function.Name}\", \"arguments\": {tc.Function.Arguments ?? "{}"}}}\n```");
                         }
                     }
 
@@ -432,6 +321,7 @@ public partial class GeminiWebChatService(
                     break;
 
                 case "tool":
+                case "function":
                     var toolName = !string.IsNullOrEmpty(message.Name)
                         ? message.Name
                         : (!string.IsNullOrEmpty(message.ToolCallId) ? message.ToolCallId : "tool");
@@ -445,7 +335,7 @@ public partial class GeminiWebChatService(
             }
         }
 
-        if (messages.Count > 0 && messages[^1].Role == "tool")
+        if (conversation.Count > 0 && conversation[^1].Role is "tool" or "function")
         {
             parts.Add("Based on the tool results above, proceed with the next step to fulfill the user's request by calling the appropriate tool or completing the task.");
         }
@@ -454,7 +344,54 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Extracts text from multimodal content parts.
+    /// Cleans the replayed history before it is flattened into a prompt:
+    /// drops canned Gemini error replies (they make the model repeat the error) and
+    /// collapses identical consecutive user messages (agent clients resend the request after an error).
+    /// </summary>
+    public static List<OpenAIMessage> SanitizeMessages(List<OpenAIMessage> messages)
+    {
+        var result = new List<OpenAIMessage>(messages.Count);
+
+        foreach (var message in messages)
+        {
+            if (message == null) continue;
+
+            if (message.Role == "assistant" &&
+                message.ToolCalls is not { Count: > 0 } &&
+                IsGeminiGlitchResponse(GetMessageText(message)))
+            {
+                continue;
+            }
+
+            if (message.Role == "user" &&
+                result.Count > 0 &&
+                result[^1].Role == "user" &&
+                GetMessageText(result[^1]) == GetMessageText(message))
+            {
+                result[^1] = message;
+                continue;
+            }
+
+            result.Add(message);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Returns the plain text of a message whose content is either a string or an array of content parts.
+    /// </summary>
+    private static string GetMessageText(OpenAIMessage message)
+    {
+        if (message.Content is not { } content) return string.Empty;
+
+        return content.ValueKind == JsonValueKind.String
+            ? content.GetString() ?? string.Empty
+            : ExtractTextFromContentParts(content);
+    }
+
+    /// <summary>
+    /// Extracts text from multimodal content parts (non-text parts such as images are skipped).
     /// </summary>
     private static string ExtractTextFromContentParts(JsonElement content)
     {
@@ -463,10 +400,16 @@ public partial class GeminiWebChatService(
         var texts = new List<string>();
         foreach (var part in content.EnumerateArray())
         {
-            var contentPart = JsonSerializer.Deserialize<OpenAIContentPart>(part.GetRawText());
-            if (contentPart?.Type == "text" && contentPart.Text != null)
+            if (part.ValueKind == JsonValueKind.String)
             {
-                texts.Add(contentPart.Text);
+                if (part.GetString() is { } plain) texts.Add(plain);
+            }
+            else if (part.ValueKind == JsonValueKind.Object &&
+                     part.TryGetProperty("text", out var textProp) &&
+                     textProp.ValueKind == JsonValueKind.String &&
+                     textProp.GetString() is { } partText)
+            {
+                texts.Add(partText);
             }
         }
 
@@ -475,10 +418,14 @@ public partial class GeminiWebChatService(
 
     /// <summary>
     /// Detects whether the response from Gemini Web is an internal glitch / canned error message.
+    /// Only short replies qualify: a long answer that merely mentions such a phrase (e.g. generated
+    /// error-page code) is legitimate content.
     /// </summary>
     public static bool IsGeminiGlitchResponse(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return false;
+        if (text.Trim().Length > 200) return false;
+
         return text.Contains("I encountered an error doing what you asked", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("I seem to be encountering an error", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Sorry, something went wrong", StringComparison.OrdinalIgnoreCase) ||
@@ -487,54 +434,111 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Sends a request to the Gemini Web batchexecute endpoint.
+    /// Calls StreamGenerate and returns the final text, retrying transient failures:
+    /// 401/403 (session refresh), 4xx/5xx upstream errors, Gemini's canned glitch replies and empty replies.
+    /// <paramref name="onProgress"/> receives each accumulated text snapshot as soon as it arrives;
+    /// retries only happen while nothing has been handed to it yet.
+    /// Throws <see cref="GeminiWebUpstreamException"/> when every attempt failed.
     /// </summary>
-    private async Task<string> SendBatchExecuteAsync(string cookies, string prompt, GeminiWebModelConfig modelConfig, bool stream)
+    private async Task<string> GenerateWithRetryAsync(
+        string cookies,
+        string prompt,
+        GeminiWebModelConfig modelConfig,
+        Func<string, Task>? onProgress = null)
     {
-        for (var attempt = 1; attempt <= 3; attempt++)
+        var failure = "Gemini Web returned no response";
+
+        for (var attempt = 1; attempt <= MaxUpstreamAttempts; attempt++)
         {
-            var request = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream);
-
-            var response = await httpClient.SendAsync(request);
+            using var httpRequestMessage = await BuildBatchExecuteRequestAsync(cookies, prompt, modelConfig, stream: true);
+            using var response = await httpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
             await cookieManager.UpdateFromResponseAsync(response);
-            var responseBody = await response.Content.ReadAsStringAsync();
 
-            if (response.IsSuccessStatusCode)
+            if (!response.IsSuccessStatusCode)
             {
-                if (attempt < 3 && IsGeminiGlitchResponse(responseBody))
+                var errorBody = await response.Content.ReadAsStringAsync();
+                logger.LogWarning("Gemini Web API error on attempt {Attempt}/{Max}: {StatusCode} - {Body}",
+                    attempt, MaxUpstreamAttempts, response.StatusCode, errorBody.Length > 500 ? errorBody[..500] : errorBody);
+
+                // Retrying (and refreshing the session) only makes Google's throttling worse
+                if (GeminiWebUpstreamException.IsRateLimited(response))
                 {
-                    logger.LogWarning("Gemini Web returned temporary glitch response on attempt {Attempt}. Retrying in 500ms...", attempt);
-                    await Task.Delay(500);
+                    throw GeminiWebUpstreamException.RateLimited();
+                }
+
+                // Stale bl/at parameters or expired cookies: rebuild the session before trying again
+                sessionService.InvalidateSession();
+
+                if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+                {
+                    if (attempt == 1)
+                    {
+                        logger.LogInformation("Refreshing session and retrying after 401/403...");
+                        continue;
+                    }
+
+                    throw new GeminiWebUpstreamException(401, "Authentication failed. Cookies may be invalid or expired.");
+                }
+
+                failure = $"Gemini Web API error: {(int)response.StatusCode} {response.StatusCode}";
+                if (attempt < MaxUpstreamAttempts && (int)response.StatusCode >= 500)
+                {
+                    await Task.Delay(500 * attempt);
                     continue;
                 }
 
-                return responseBody;
+                throw new GeminiWebUpstreamException(502, failure);
             }
 
-            logger.LogWarning("Gemini Web API error on attempt {Attempt}: {StatusCode} - {Body}", attempt, response.StatusCode, responseBody);
+            using var stream = await response.Content.ReadAsStreamAsync();
+            using var reader = new StreamReader(stream);
 
-            if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                 response.StatusCode == System.Net.HttpStatusCode.Forbidden) && attempt == 1)
+            var lastText = string.Empty;
+            var emitted = false;
+            var glitch = false;
+
+            while (await reader.ReadLineAsync() is { } line)
             {
-                logger.LogInformation("Refreshing session and retrying after 401/403...");
-                sessionService.InvalidateSession();
-                continue;
+                var trimmed = line.Trim();
+                if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(")]}'") || int.TryParse(trimmed, out _))
+                    continue;
+
+                var currentText = ExtractStreamingText(trimmed);
+                if (string.IsNullOrEmpty(currentText)) continue;
+
+                if (IsGeminiGlitchResponse(currentText))
+                {
+                    glitch = true;
+                    if (!emitted && string.IsNullOrEmpty(lastText)) break;
+                    continue; // real content already arrived; ignore the trailing error marker
+                }
+
+                lastText = currentText;
+
+                if (onProgress != null)
+                {
+                    await onProgress(currentText);
+                    emitted = true;
+                }
             }
 
-            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
-                response.StatusCode == System.Net.HttpStatusCode.Forbidden)
-            {
-                sessionService.InvalidateSession();
-                throw new HttpRequestException("Authentication failed. Cookies may be invalid or expired.");
-            }
+            if (!string.IsNullOrWhiteSpace(lastText))
+                return lastText;
 
-            if (attempt == 3)
+            failure = glitch
+                ? "Gemini Web returned a temporary error (\"I encountered an error doing what you asked\")"
+                : "Gemini Web returned an empty response";
+            logger.LogWarning("{Failure} on attempt {Attempt}/{Max}", failure, attempt, MaxUpstreamAttempts);
+
+            if (attempt < MaxUpstreamAttempts)
             {
-                throw new HttpRequestException($"Gemini Web API error: {response.StatusCode} - {responseBody}");
+                // From the second failure on, rebuild bl/at in case the cached session went stale
+                if (attempt >= 2) sessionService.InvalidateSession();
+                await Task.Delay(500 * attempt);
             }
         }
 
-        throw new HttpRequestException("Failed to send request to Gemini Web after retry.");
+        throw new GeminiWebUpstreamException(502, $"{failure} on all {MaxUpstreamAttempts} attempts. Please retry.");
     }
 
     /// <summary>
@@ -916,9 +920,13 @@ public partial class GeminiWebChatService(
             return (text, null);
         }
 
-        var knownTools = tools != null && tools.Count > 0
-            ? new HashSet<string>(tools.Select(t => t.Function.Name), StringComparer.OrdinalIgnoreCase)
-            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Without declared tools nothing can be a tool call: a ```json snippet in a normal answer must stay text.
+        if (tools == null || tools.Count == 0)
+        {
+            return (text, null);
+        }
+
+        var knownTools = new HashSet<string>(tools.Select(t => t.Function.Name), StringComparer.OrdinalIgnoreCase);
 
         var toolCalls = new List<OpenAIToolCall>();
         var cleanText = text;

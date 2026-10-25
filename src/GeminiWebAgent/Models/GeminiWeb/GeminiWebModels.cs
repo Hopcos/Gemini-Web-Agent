@@ -111,9 +111,9 @@ public static class GeminiWebModelMap
         ["gemini-1.5-flash"] = new(1, 4, "gemini-1.5-flash", "Gemini 1.5 Flash", "fast model")
     };
 
-    public static GeminiWebModelConfig GetModelConfig(string openAIModelName)
+    public static GeminiWebModelConfig GetModelConfig(string? openAIModelName)
     {
-        var trimmed = openAIModelName.Trim();
+        var trimmed = openAIModelName?.Trim() ?? string.Empty;
         if (ModelConfigMapping.TryGetValue(trimmed, out var config))
         {
             return config;
@@ -135,7 +135,7 @@ public static class GeminiWebModelMap
         return DefaultConfig;
     }
 
-    public static string GetGeminiModelId(string openAIModelName) => GetModelConfig(openAIModelName).CanonicalName;
+    public static string GetGeminiModelId(string? openAIModelName) => GetModelConfig(openAIModelName).CanonicalName;
 
     public static List<string> GetAllModels() => [.. CanonicalModels];
 }

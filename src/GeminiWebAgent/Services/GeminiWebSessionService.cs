@@ -110,6 +110,11 @@ public partial class GeminiWebSessionService(
         await cookieManager.UpdateFromResponseAsync(response);
         var html = await response.Content.ReadAsStringAsync();
 
+        if (GeminiWebUpstreamException.IsRateLimited(response))
+        {
+            throw GeminiWebUpstreamException.RateLimited();
+        }
+
         if (!response.IsSuccessStatusCode)
         {
             logger.LogWarning("Fetch from /app failed with {StatusCode}, falling back to BaseUrl...", response.StatusCode);

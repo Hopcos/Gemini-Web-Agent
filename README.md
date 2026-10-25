@@ -83,7 +83,12 @@ GeminiWebAgent 在底层原生打通了 OpenAI Tool Calling 规范：
   - **真实 Token 估算统计**：中英文多模态精确估算 `Usage`（`prompt_tokens`, `completion_tokens`, `total_tokens`），告别客户端 UI 显示 `用量 0 tok` 的困扰；
   - **云端全量毛刺智能拦截重试 (Glitch Auto-Recovery)**：
     - 全面捕获 Gemini Web 各类瞬态模板报错（如 *"I encountered an error doing what you asked"*、*"I seem to be encountering an error. Can I try something else for you?"*、*"Sorry, something went wrong"*、*"I'm having a hard time fulfilling your request"* 等）；
-    - 在非流式与流式下发前实施静默拦截并启动指数退避自动重试（最多 3 次），杜绝报错信息污染客户端 Agent 对话流。
+    - 在非流式与流式下发前实施静默拦截并启动退避自动重试（最多 3 次，第 2 次起刷新 `bl`/`at` 会话参数），杜绝报错信息污染客户端 Agent 对话流；仅匹配 200 字符以内的短回复，避免误伤正文中恰好包含这些句子的代码。
+    - 重试耗尽后返回**真实 HTTP 错误**（502，OpenAI 错误体），而不是空回复或把报错文案当作答案——客户端据此重试/提示，且不会把错误写入对话历史。
+    - 回放历史时自动剔除历史中的 Gemini 报错回复，并合并因报错而被客户端重复发送的相同用户消息，避免模型被历史污染而反复报错/答非所问。
+  - **限流识别（`google.com/sorry`）**：短时间内请求过密时 Google 会 302 到反滥用验证页。网关识别后立即返回 `429 rate_limited`（不重试、不刷新会话以免加重限流）。出现时请暂停请求，并在同一网络的浏览器中打开 gemini.google.com 完成验证。
+  - **无工具（文本协议）模式不再谎称已完成**：不再向模型断言“所有工具均已可用并由客户端代为执行”，该措辞会让模型在没有任何工具通道时编造“已成功修改文件”。现在仅引导模型遵循客户端系统提示词中定义的工具语法，且要求只有工具结果确认后才可声明已修改。
+  - **请求体宽容解析**：`stop` 支持字符串/数组，`tool_calls[].function.arguments` 支持字符串/对象，`model` 为空回退默认模型，`developer`/`function` 角色可识别；无法解析的请求返回带说明的 JSON 400，而不是空响应。
 
 ---
 
@@ -396,7 +401,7 @@ E:\Personal\GeminiWebAgent\
 
 执行结果：
 ```
-已通过! - 失败: 0，通过: 45，已跳过: 0，总计: 45，持续时间: 25 s - GeminiWebAgent.Tests.dll (net10.0)
+已通过! - 失败: 0，通过: 55，已跳过: 0，总计: 55，持续时间: 25 s - GeminiWebAgent.Tests.dll (net10.0)
 ==========================================================
    ALL .NET 10 TESTS PASSED SUCCESSFULLY! (100% PASS)    
 ==========================================================
