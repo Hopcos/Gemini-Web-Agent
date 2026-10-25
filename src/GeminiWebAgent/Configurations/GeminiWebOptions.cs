@@ -40,4 +40,9 @@ public class GeminiWebOptions
     /// 后台保活巡检间隔（分钟，默认 120 分钟），主动访问以触发滚动 Cookie 刷新
     /// </summary>
     public int KeepAliveIntervalMinutes { get; set; } = 120;
+
+    /// <summary>
+    /// 调试开关：将发给 Gemini 的提示词尾部与模型原始回复写入日志（默认关闭，内容可能包含源码/敏感信息）
+    /// </summary>
+    public bool LogPayloads { get; set; }
 }

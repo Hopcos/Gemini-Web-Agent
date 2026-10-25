@@ -39,6 +39,7 @@ public partial class GeminiWebChatService(
 
         var (cleanText, toolCalls) = ParseToolCalls(parsedText, effectiveTools);
         var finishReason = toolCalls != null && toolCalls.Count > 0 ? "tool_calls" : "stop";
+        LogReply(prompt, parsedText, effectiveTools, toolCalls);
 
         var promptTokens = EstimateTokens(prompt);
         var completionTokens = EstimateTokens(parsedText);
@@ -68,6 +69,7 @@ public partial class GeminiWebChatService(
 
                 var (cleanText, toolCalls) = ParseToolCalls(fullText, effectiveTools);
                 var finishReason = toolCalls != null && toolCalls.Count > 0 ? "tool_calls" : "stop";
+                LogReply(prompt, fullText, effectiveTools, toolCalls);
 
                 // 1. If there is explanatory text, emit text chunk first
                 if (!string.IsNullOrEmpty(cleanText))
@@ -155,6 +157,29 @@ public partial class GeminiWebChatService(
         logger.LogInformation(
             "Chat request: model={Model} stream={Stream} messages={Messages} tools={Tools} promptChars={PromptChars} lastRole={LastRole}",
             model, request.Stream, request.Messages.Count, tools?.Count ?? 0, prompt.Length, request.Messages.LastOrDefault()?.Role);
+    }
+
+    /// <summary>
+    /// A reply that mentions a tool call but yielded none ends the agent loop silently, so say so loudly.
+    /// With GeminiWeb:LogPayloads the prompt tail and the full reply are logged as well.
+    /// </summary>
+    private void LogReply(string prompt, string reply, List<OpenAITool>? tools, List<OpenAIToolCall>? toolCalls)
+    {
+        var parsedCount = toolCalls?.Count ?? 0;
+        logger.LogInformation("Reply: chars={Chars} toolCalls={ToolCalls}", reply.Length, parsedCount);
+
+        if (tools is { Count: > 0 } && parsedCount == 0 &&
+            (reply.Contains("tool_call", StringComparison.OrdinalIgnoreCase) || reply.Contains("\"arguments\"", StringComparison.Ordinal)))
+        {
+            logger.LogWarning("Reply looks like a tool call but none could be parsed; it is returned as plain text and ends the agent loop. Reply: {Reply}",
+                reply.Length > 3000 ? reply[..3000] : reply);
+        }
+
+        if (_options.LogPayloads)
+        {
+            logger.LogInformation("Payload prompt (tail): {Prompt}", prompt.Length > 4000 ? prompt[^4000..] : prompt);
+            logger.LogInformation("Payload reply: {Reply}", reply.Length > 6000 ? reply[..6000] : reply);
+        }
     }
 
     private static async Task WriteSseAsync(HttpResponse httpResponse, OpenAIChatCompletionResponse chunk)
@@ -253,9 +278,11 @@ public partial class GeminiWebChatService(
                 "```\n" +
                 "4. AUTONOMOUS WORKSPACE EXPLORATION: When asked to add, build, modify, or integrate features, themes, or code, NEVER ask the user what frontend framework, libraries, or configuration files are used. You MUST first use available tools (such as list_files or read_file) to inspect the project structure, package.json, or workspace files autonomously.\n" +
                 "5. DIRECT ACTION: Do NOT output greetings, self-introductions, or announcements of your model identity at the beginning of your responses. Proceed directly to calling the appropriate tools or answering the request.\n" +
-                "6. Always provide every required argument of the tool you call.\n" +
+                "6. Always provide every required argument of the tool you call. The block must contain valid JSON: write newlines inside string values as \\n and escape double quotes.\n" +
                 "7. A file is only created, modified or a command only run once a [Tool Result ...] in this conversation confirms it. Never state or imply otherwise.\n" +
-                "8. Reply to the latest message in the conversation; earlier turns are context only."
+                "8. Reply to the latest message in the conversation; earlier turns are context only.\n" +
+                "9. COMPLETE THE WHOLE REQUEST: a single edit is rarely the whole job. After every [Tool Result] decide what is still missing (other files to create or update, wiring, defaults, a build or test run) and call the next tool right away. Reply without a tool call only when every part of the request is implemented, and then give a short summary.\n" +
+                "10. When several steps are independent (for example creating several files) you may output several ```tool_call blocks in one reply; they are executed in order."
             );
         }
         else if (conversation.Any(m => m.Role is "system" or "developer" && GetMessageText(m).Length > 0))
@@ -271,7 +298,8 @@ public partial class GeminiWebChatService(
                 "2. Inspect the workspace with the client's tools instead of asking the user for information you can discover yourself.\n" +
                 "3. Only report that a file was changed or a command was run once a tool result in this conversation confirms it.\n" +
                 "4. When asked about your model name or identity, answer that you are " + modelConfig.DisplayName + ".\n" +
-                "5. Reply to the latest message in the conversation without greetings or self-introduction; earlier turns are context only."
+                "5. Reply to the latest message in the conversation without greetings or self-introduction; earlier turns are context only.\n" +
+                "6. Keep working step by step until the whole request is implemented; do not stop or summarize after the first edit while parts are still missing."
             );
         }
         else
@@ -337,7 +365,7 @@ public partial class GeminiWebChatService(
 
         if (conversation.Count > 0 && conversation[^1].Role is "tool" or "function")
         {
-            parts.Add("Based on the tool results above, proceed with the next step to fulfill the user's request by calling the appropriate tool or completing the task.");
+            parts.Add("Based on the tool results above, continue with the next step of the user's request: if anything is still missing or unverified, call the next tool now. Only when the whole request is fully done, reply with a short summary and no tool call.");
         }
 
         return string.Join("\n\n", parts);
@@ -911,7 +939,11 @@ public partial class GeminiWebChatService(
     }
 
     /// <summary>
-    /// Parses tool_call codeblocks from model text output.
+    /// Extracts tool calls from the model's text output.
+    /// A call is a JSON object following a ```tool_call / ```json / ``` fence, a &lt;tool_call&gt; tag, or making up the whole reply.
+    /// The object is cut out by brace matching (not by the closing fence) so file contents that themselves
+    /// contain ``` survive, and raw newlines inside JSON strings are repaired. Anything that is not a call to a
+    /// declared tool stays in the text.
     /// </summary>
     public static (string? CleanText, List<OpenAIToolCall>? ToolCalls) ParseToolCalls(string text, List<OpenAITool>? tools)
     {
@@ -926,120 +958,250 @@ public partial class GeminiWebChatService(
             return (text, null);
         }
 
-        var knownTools = new HashSet<string>(tools.Select(t => t.Function.Name), StringComparer.OrdinalIgnoreCase);
+        var toolNames = new Dictionary<string, string>();
+        foreach (var tool in tools)
+        {
+            toolNames.TryAdd(NormalizeToolName(tool.Function.Name), tool.Function.Name);
+        }
 
         var toolCalls = new List<OpenAIToolCall>();
-        var cleanText = text;
+        var cleanText = new StringBuilder();
+        var consumedUntil = 0;
 
-        // 1. Try ```tool_call ... ``` or ```json ... ``` blocks
-        var matches = CodeBlockRegex().Matches(text);
-        foreach (Match match in matches)
+        foreach (var candidate in FindToolCallCandidates(text))
         {
-            var blockContent = match.Groups[1].Value.Trim();
-            if (TryParseToolCallJson(blockContent, knownTools, out var call))
-            {
-                toolCalls.Add(call);
-                cleanText = cleanText.Replace(match.Value, string.Empty);
-            }
+            if (candidate.JsonStart < consumedUntil) continue; // inside an already extracted call (e.g. file content)
+
+            var jsonEnd = FindJsonObjectEnd(text, candidate.JsonStart);
+            if (jsonEnd < 0) continue;
+
+            var json = text[candidate.JsonStart..jsonEnd];
+            if (!TryParseToolCallJson(json, toolNames, out var call)) continue;
+
+            var end = SkipClosingMarker(text, jsonEnd);
+            cleanText.Append(text, consumedUntil, candidate.MarkerStart - consumedUntil);
+            consumedUntil = end;
+            toolCalls.Add(call);
         }
 
-        // 2. Try XML-style <tool_call>...</tool_call>
-        var xmlMatches = XmlToolCallRegex().Matches(cleanText);
-        foreach (Match match in xmlMatches)
+        cleanText.Append(text, consumedUntil, text.Length - consumedUntil);
+
+        for (var i = 0; i < toolCalls.Count; i++)
         {
-            var blockContent = match.Groups[1].Value.Trim();
-            if (TryParseToolCallJson(blockContent, knownTools, out var call))
-            {
-                toolCalls.Add(call);
-                cleanText = cleanText.Replace(match.Value, string.Empty);
-            }
+            toolCalls[i].Index = i;
         }
 
-        // 3. Fallback: if no blocks matched, check if entire response is a JSON tool call
-        if (toolCalls.Count == 0 && cleanText.TrimStart().StartsWith('{'))
+        if (toolCalls.Count == 0)
         {
-            if (TryParseToolCallJson(cleanText.Trim(), knownTools, out var call))
-            {
-                toolCalls.Add(call);
-                cleanText = null;
-            }
+            return (text.Trim() is { Length: > 0 } unchanged ? unchanged : null, null);
         }
 
-        if (toolCalls.Count > 0)
-        {
-            for (var i = 0; i < toolCalls.Count; i++)
-            {
-                toolCalls[i].Index = i;
-            }
-        }
-
-        var trimmed = cleanText?.Trim();
-        var finalContent = string.IsNullOrEmpty(trimmed) ? null : trimmed;
-
-        return (finalContent, toolCalls.Count > 0 ? toolCalls : null);
+        var trimmed = cleanText.ToString().Trim();
+        return (string.IsNullOrEmpty(trimmed) ? null : trimmed, toolCalls);
     }
 
-    private static bool TryParseToolCallJson(string jsonStr, HashSet<string> knownTools, out OpenAIToolCall call)
+    private readonly record struct ToolCallCandidate(int MarkerStart, int JsonStart);
+
+    /// <summary>
+    /// Positions where a tool call object may start: after an opening fence / tag, or at the start of the reply.
+    /// </summary>
+    private static IEnumerable<ToolCallCandidate> FindToolCallCandidates(string text)
+    {
+        var firstNonSpace = 0;
+        while (firstNonSpace < text.Length && char.IsWhiteSpace(text[firstNonSpace])) firstNonSpace++;
+        if (firstNonSpace < text.Length && text[firstNonSpace] == '{')
+        {
+            yield return new ToolCallCandidate(0, firstNonSpace);
+        }
+
+        foreach (Match opener in ToolCallOpenerRegex().Matches(text))
+        {
+            var jsonStart = opener.Index + opener.Length;
+            while (jsonStart < text.Length && char.IsWhiteSpace(text[jsonStart])) jsonStart++;
+
+            if (jsonStart < text.Length && text[jsonStart] == '{' && jsonStart != firstNonSpace)
+            {
+                yield return new ToolCallCandidate(opener.Index, jsonStart);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the index just past the JSON object starting at <paramref name="start"/>, or -1 when it never closes.
+    /// String-aware, so braces / fences inside string values do not matter.
+    /// </summary>
+    private static int FindJsonObjectEnd(string text, int start)
+    {
+        var depth = 0;
+        var inString = false;
+
+        for (var i = start; i < text.Length; i++)
+        {
+            var c = text[i];
+
+            if (inString)
+            {
+                if (c == '\\') i++;
+                else if (c == '"') inString = false;
+                continue;
+            }
+
+            switch (c)
+            {
+                case '"': inString = true; break;
+                case '{': depth++; break;
+                case '}':
+                    depth--;
+                    if (depth == 0) return i + 1;
+                    break;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Skips the closing ``` or &lt;/tool_call&gt; that follows a call (it may be missing when the reply was cut short).
+    /// </summary>
+    private static int SkipClosingMarker(string text, int position)
+    {
+        var i = position;
+        while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
+
+        if (string.CompareOrdinal(text, i, "```", 0, 3) == 0) return i + 3;
+        if (string.Compare(text, i, "</tool_call>", 0, 12, StringComparison.OrdinalIgnoreCase) == 0) return i + 12;
+
+        return position;
+    }
+
+    private static string NormalizeToolName(string name)
+    {
+        // "functions.read_file" / "default_api:read_file" -> "read_file"
+        var cut = name.LastIndexOfAny(['.', ':', '/']);
+        if (cut >= 0 && cut < name.Length - 1) name = name[(cut + 1)..];
+
+        return new string(name.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+    }
+
+    private static readonly string[] ToolNameKeys = ["name", "tool", "tool_name", "toolName", "function", "function_name", "action"];
+    private static readonly string[] ToolArgumentKeys = ["arguments", "parameters", "args", "input", "params"];
+
+    private static bool TryParseToolCallJson(string jsonStr, Dictionary<string, string> toolNames, out OpenAIToolCall call)
     {
         call = new OpenAIToolCall();
-        try
+
+        if (!TryParseJsonObject(jsonStr, out var doc)) return false;
+
+        using (doc)
         {
-            using var doc = JsonDocument.Parse(jsonStr);
             var root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object) return false;
+
+            // {"function_call": {...}} / {"function": {"name": ..., "arguments": ...}} wrap the real call one level down
+            foreach (var wrapper in new[] { "function_call", "tool_call", "function" })
+            {
+                if (root.TryGetProperty(wrapper, out var inner) && inner.ValueKind == JsonValueKind.Object)
+                {
+                    root = inner;
+                    break;
+                }
+            }
 
             string? name = null;
-            if (root.TryGetProperty("name", out var nameProp) && nameProp.ValueKind == JsonValueKind.String)
+            foreach (var key in ToolNameKeys)
             {
-                name = nameProp.GetString();
-            }
-            else if (root.TryGetProperty("function", out var fnProp) && fnProp.ValueKind == JsonValueKind.Object &&
-                     fnProp.TryGetProperty("name", out var fnNameProp) && fnNameProp.ValueKind == JsonValueKind.String)
-            {
-                name = fnNameProp.GetString();
+                if (root.TryGetProperty(key, out var nameProp) && nameProp.ValueKind == JsonValueKind.String)
+                {
+                    name = nameProp.GetString();
+                    break;
+                }
             }
 
             if (string.IsNullOrEmpty(name)) return false;
+            if (!toolNames.TryGetValue(NormalizeToolName(name), out var declaredName)) return false;
 
-            if (knownTools.Count > 0 && !knownTools.Contains(name))
+            var argumentsStr = "{}";
+            foreach (var key in ToolArgumentKeys)
             {
-                return false;
-            }
+                if (!root.TryGetProperty(key, out var argsProp)) continue;
 
-            string argumentsStr = "{}";
-            if (root.TryGetProperty("arguments", out var argsProp))
-            {
                 argumentsStr = argsProp.ValueKind == JsonValueKind.String
                     ? argsProp.GetString() ?? "{}"
                     : argsProp.GetRawText();
-            }
-            else if (root.TryGetProperty("parameters", out var paramsProp))
-            {
-                argumentsStr = paramsProp.ValueKind == JsonValueKind.String
-                    ? paramsProp.GetString() ?? "{}"
-                    : paramsProp.GetRawText();
+                break;
             }
 
             call.Id = $"call_{Guid.NewGuid():N}"[..12];
             call.Type = "function";
             call.Function = new OpenAIToolCallFunction
             {
-                Name = name,
+                Name = declaredName,
                 Arguments = argumentsStr
             };
             return true;
         }
-        catch
-        {
-            return false;
-        }
     }
 
-    [GeneratedRegex(@"```(?:tool_call|json)?\s*\n?(.*?)\n?```", RegexOptions.Singleline)]
-    private static partial Regex CodeBlockRegex();
+    /// <summary>
+    /// Parses a JSON object, repairing the usual model slip: raw newlines / tabs inside string values.
+    /// </summary>
+    private static bool TryParseJsonObject(string json, out JsonDocument doc)
+    {
+        foreach (var candidate in new[] { json, EscapeControlCharsInStrings(json) })
+        {
+            try
+            {
+                doc = JsonDocument.Parse(candidate);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object) return true;
+                doc.Dispose();
+            }
+            catch (JsonException)
+            {
+                // try the repaired variant
+            }
+        }
 
-    [GeneratedRegex(@"<tool_call>\s*(.*?)\s*</tool_call>", RegexOptions.Singleline)]
-    private static partial Regex XmlToolCallRegex();
+        doc = null!;
+        return false;
+    }
+
+    private static string EscapeControlCharsInStrings(string json)
+    {
+        var sb = new StringBuilder(json.Length + 16);
+        var inString = false;
+
+        for (var i = 0; i < json.Length; i++)
+        {
+            var c = json[i];
+
+            if (!inString)
+            {
+                if (c == '"') inString = true;
+                sb.Append(c);
+                continue;
+            }
+
+            switch (c)
+            {
+                case '\\' when i + 1 < json.Length:
+                    sb.Append(c).Append(json[++i]);
+                    break;
+                case '"':
+                    inString = false;
+                    sb.Append(c);
+                    break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default: sb.Append(c); break;
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    // ```tool_call / ```json / ```js / bare ``` followed by the object, or an XML-style tag
+    [GeneratedRegex(@"```[A-Za-z_]*[ \t]*\r?\n?|<tool_call>", RegexOptions.IgnoreCase)]
+    private static partial Regex ToolCallOpenerRegex();
 
     /// <summary>
     /// Builds a streaming chunk response.
